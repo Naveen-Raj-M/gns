@@ -33,6 +33,7 @@ python3 -m gns.train mode="train" training.resume=True
 # For mesh-based domain,
 python3 -m meshnet.train mode="train" training.resume=True
 ```
+To choose not to render after rollout prediction, add the option `rendering.render=False`
 
 > Rollout prediction
 ```shell
@@ -118,6 +119,16 @@ hardware:
 # Logging configuration
 logging:
   tensorboard_dir: logs/
+
+# Rendering configuration
+rendering:
+  render: True
+  format: gif
+
+# gif configuration
+  gif:
+    step_stride: 3
+    change_yz: False
 ```
 
 </details>
