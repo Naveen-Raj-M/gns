@@ -59,3 +59,15 @@ rendering:
     vertical_camera_angle: 20
     viewpoint_rotation: 0.3
     change_yz: False
+
+# Reptile Configuration
+reptile:
+  inner_loop:
+    batch_size: 34
+    num_batches: 1
+    iterations: 5
+  
+  outer_loop:
+    batch_size: 5
+    step_size: 1
+    iterations: 10000

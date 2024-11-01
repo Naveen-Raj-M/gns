@@ -68,6 +68,25 @@ class RenderingConfig:
 
 
 @dataclass
+class InnerLoopConfig:
+    batch_size: int = 34
+    iterations: int = 5
+
+
+@dataclass
+class OuterLoopConfig:
+    batch_size: int = 5
+    step_size: int = 1
+    iterations: int = 10000
+
+
+@dataclass
+class ReptileConfig:
+    inner_loop: InnerLoopConfig = field(default_factory=InnerLoopConfig)
+    outer_loop: OuterLoopConfig = field(default_factory=OuterLoopConfig)
+
+
+@dataclass
 class Config:
     mode: str = "train"
     data: DataConfig = field(default_factory=DataConfig)
@@ -77,6 +96,7 @@ class Config:
     hardware: HardwareConfig = field(default_factory=HardwareConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     rendering: RenderingConfig = field(default_factory=RenderingConfig)
+    reptile: ReptileConfig = field(default_factory=ReptileConfig)
 
 
 # Hydra configuration
