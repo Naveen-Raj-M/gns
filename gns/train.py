@@ -5,12 +5,14 @@ import pickle
 import glob
 import re
 import sys
+import copy
 
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
+from collections import defaultdict
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -415,6 +417,18 @@ def load_datasets(cfg, use_dist):
     return train_dl, valid_dl, n_features
 
 
+def sample_task(data_iter, train_dl):
+    """Extract one example sequentially from the DataLoader."""
+    try:
+        # Extract one example sequentially from train_dl
+        example = next(data_iter)
+    except StopIteration:
+        # If the DataLoader is exhausted, reinitialize the iterator
+        data_iter = iter(train_dl)
+        example = next(data_iter)
+    return example, data_iter
+
+
 def setup_tensorboard(cfg, metadata):
     """Setup tensorboard.
 
@@ -742,6 +756,245 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
         distribute.cleanup()
 
 
+def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
+    """
+    Train the model using the Reptile algorithm.
+        rank (int): Local rank of the process.
+        cfg (dict): Configuration dictionary containing training parameters.
+        world_size (int): Total number of ranks in the distributed setup.
+        device (torch.device): Torch device type (e.g., torch.device("cuda")).
+        verbose (bool): Flag to enable verbose logging (typically for rank 0 or CPU).
+        use_dist (bool): Flag to indicate if torch.distributed should be used.
+    Returns:
+        None
+    """
+    device_id = rank if device == torch.device("cuda") else device
+
+    # Initialize simulator and optimizer
+    simulator, optimizer, metadata = initialize_training(
+        cfg, rank, world_size, device, use_dist
+    )
+
+    # Initialize training state
+    step = 0
+    steps_per_meta_iter = 0
+
+    valid_loss = None
+    train_loss = 0
+    iter_valid_loss = None
+
+    train_loss_hist = []
+    valid_loss_hist = []
+
+    simulator.train()
+    simulator.to(device_id)
+
+    # Load datasets
+    train_dl, valid_dl, n_features = load_datasets(cfg, use_dist)
+    train_data_iter = iter(train_dl)
+
+    print(f"rank = {rank}, cuda = {torch.cuda.is_available()}")
+
+    writer = setup_tensorboard(cfg, metadata) if verbose else None
+
+    meta_iters = cfg.reptile.outer_loop.iterations
+    if verbose:
+        print(f"Total meta iterations = {meta_iters}")
+
+    for meta_iteration in tqdm(
+        range(meta_iters), desc="Meta-Training", unit="meta_iters", disable=not verbose
+    ):
+        if use_dist:
+            torch.distributed.barrier()
+
+        # Extract the Encoder from the simulator
+        main_encoder = simulator._encode_process_decode._encoder
+        phi = {name: param.clone() for name, param in main_encoder.named_parameters()}
+
+        # Save the encoder's state dictionary before training
+        torch.save(main_encoder.state_dict(), "encoder_before.pth")
+
+        phi_tildes = []
+
+        iter_loss = 0.0
+        steps_this_meta_iter = 0
+        total_steps = (
+            cfg.reptile.outer_loop.batch_size * cfg.reptile.inner_loop.iterations
+        )
+        with tqdm(
+            range(steps_this_meta_iter % total_steps, total_steps),
+            desc=f"Meta-Iteration {meta_iteration}",
+            unit="batch",
+            disable=not verbose,
+        ) as pbar:
+
+            for _ in range(cfg.reptile.outer_loop.batch_size):
+                steps_per_meta_iter += 1
+
+                # Sample a task
+                example, train_data_iter = sample_task(train_data_iter, train_dl)
+
+                # Prepare data
+                (
+                    position,
+                    particle_type,
+                    material_property,
+                    n_particles_per_example,
+                    labels,
+                ) = prepare_data(example, device_id)
+
+                n_particles_per_example = n_particles_per_example.to(device_id)
+                labels = labels.to(device_id)
+
+                sampled_noise = noise_utils.get_random_walk_noise_for_position_sequence(
+                    position, noise_std_last_step=cfg.data.noise_std
+                ).to(device_id)
+                non_kinematic_mask = (
+                    (particle_type != cfg.data.kinematic_particle_id)
+                    .clone()
+                    .detach()
+                    .to(device_id)
+                )
+                sampled_noise *= non_kinematic_mask.view(-1, 1, 1)
+
+                device_or_rank = rank if device == torch.device("cuda") else device
+                predict_fn = (
+                    simulator.module.predict_accelerations
+                    if use_dist
+                    else simulator.predict_accelerations
+                )
+
+                # Perform a few steps of gradient descent in the inner loop
+                for _ in range(cfg.reptile.inner_loop.iterations):
+                    pred_acc, target_acc = predict_fn(
+                        next_positions=labels.to(device_or_rank),
+                        position_sequence_noise=sampled_noise.to(device_or_rank),
+                        position_sequence=position.to(device_or_rank),
+                        nparticles_per_example=n_particles_per_example.to(
+                            device_or_rank
+                        ),
+                        particle_types=particle_type.to(device_or_rank),
+                        material_property=(
+                            material_property.to(device_or_rank)
+                            if n_features == 3
+                            else None
+                        ),
+                    )
+                    if (
+                        cfg.training.validation_interval is not None
+                        and step > 0
+                        and step % cfg.training.validation_interval == 0
+                    ):
+                        if verbose:
+                            sampled_valid_example = next(iter(valid_dl))
+                            valid_loss = validation(
+                                simulator,
+                                sampled_valid_example,
+                                n_features,
+                                cfg,
+                                rank,
+                                device_id,
+                            )
+                            writer.add_scalar("Loss/valid", valid_loss.item(), step)
+
+                    loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
+
+                    train_loss = loss.item()
+                    iter_loss += train_loss
+                    steps_this_meta_iter += 1
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    # Log training loss
+                    if verbose:
+                        writer.add_scalar("Loss/train", train_loss, step)
+
+                    avg_loss = iter_loss / steps_this_meta_iter
+                    pbar.set_postfix(
+                        loss=f"{train_loss:.2f}",
+                        avg_loss=f"{avg_loss:.2f}",
+                    )
+                    pbar.update(1)
+
+                    if verbose and step % cfg.training.save_steps == 0:
+                        save_model_and_train_state(
+                            verbose,
+                            device,
+                            simulator,
+                            cfg,
+                            step,
+                            meta_iteration,
+                            optimizer,
+                            train_loss,
+                            valid_loss,
+                            train_loss_hist,
+                            valid_loss_hist,
+                            use_dist,
+                        )
+
+                    step += 1
+
+                # Extract the Encoder from the simulator after the inner loop
+                phi_tilde = {
+                    name: param.clone()
+                    for name, param in main_encoder.named_parameters()
+                }
+                phi_tildes.append(phi_tilde)
+
+                # Replace the simulator's encoder with the phi parameters
+                main_encoder.load_state_dict(torch.load("encoder_before.pth"))
+
+        # Compute the average of phi_tilde
+        avg_phi_tilde = {
+            name: torch.zeros_like(param) for name, param in phi_tildes[0].items()
+        }
+        for phi_tilde in phi_tildes:
+            for name, param in phi_tilde.items():
+                avg_phi_tilde[name] += param
+
+        for name in avg_phi_tilde:
+            avg_phi_tilde[name] /= len(phi_tildes)
+
+        # Meta update
+        for name in phi:
+            phi[name] -= cfg.reptile.outer_loop.step_size * (
+                avg_phi_tilde[name] - phi[name]
+            )
+
+        # Replace the main encoder's parameters with the updated phi values
+        for name, param in main_encoder.named_parameters():
+            param.data.copy_(phi[name])
+
+        # meta iteration level statistics
+        avg_loss = torch.tensor([iter_loss / steps_this_meta_iter]).to(device_id)
+        if use_dist:
+            torch.distributed.reduce(avg_loss, dst=0, op=torch.distributed.ReduceOp.SUM)
+            avg_loss /= world_size
+
+        train_loss_hist.append((meta_iteration, avg_loss.item()))
+
+        if cfg.training.validation_interval is not None:
+            sampled_valid_example = next(iter(valid_dl))
+            iter_valid_loss = validation(
+                simulator, sampled_valid_example, n_features, cfg, rank, device_id
+            )
+            if device == torch.device("cuda"):
+                torch.distributed.reduce(
+                    iter_valid_loss, dst=0, op=torch.distributed.ReduceOp.SUM
+                )
+                iter_valid_loss /= world_size
+            valid_loss_hist.append((meta_iteration, iter_valid_loss.item()))
+
+        if verbose:
+            writer.add_scalar("Loss/train_epoch", avg_loss.item(), meta_iteration)
+            if cfg.training.validation_interval is not None:
+                writer.add_scalar(
+                    "Loss/valid_epoch", iter_valid_loss.item(), meta_iteration
+                )
+
+
 def _get_simulator(
     metadata: json,
     num_particle_types: int,
@@ -808,10 +1061,13 @@ def _get_simulator(
 
 
 def validation(simulator, example, n_features, cfg, rank, device_id):
-
-    position, particle_type, material_property, n_particles_per_example, labels = (
-        prepare_data(example, device_id)
-    )
+    (
+        position,
+        particle_type,
+        material_property,
+        n_particles_per_example,
+        labels,
+    ) = prepare_data(example, device_id)
 
     # Sample the noise to add to the inputs.
     sampled_noise = noise_utils.get_random_walk_noise_for_position_sequence(
@@ -858,7 +1114,7 @@ def main(cfg: Config):
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
 
-    if cfg.mode == "train":
+    if cfg.mode in ["train", "reptile"]:
         # If model_path does not exist create new directory.
         if not os.path.exists(cfg.model.path):
             os.makedirs(cfg.model.path, exist_ok=True)
@@ -878,7 +1134,11 @@ def main(cfg: Config):
             world_size = 1
             verbose = True
 
-        train(local_rank, cfg, world_size, device, verbose, use_dist)
+        if cfg.mode == "train":
+            train(local_rank, cfg, world_size, device, verbose, use_dist)
+
+        if cfg.mode == "reptile":
+            train_reptile(local_rank, cfg, world_size, device, verbose, use_dist)
 
     elif cfg.mode in ["valid", "rollout"]:
         # Set device
