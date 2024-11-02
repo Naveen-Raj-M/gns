@@ -9,11 +9,11 @@ hydra:
     dir: .
 
 # Top-level configuration
-mode: train
+mode: reptile
 
 # Data configuration
 data:
-  path: ../gns-sample/WaterDropSample/dataset/
+  path: ../ColumnCollapseFrictional/datasets/
   batch_size: 2
   noise_std: 6.7e-4
   input_sequence_length: 6
@@ -22,13 +22,13 @@ data:
 
 # Model configuration
 model:
-  path: ../gns-sample/WaterDropSample/models/
+  path: ../ColumnCollapseFrictional/models/
   file: model-1500.pt
   train_state_file: train_state-1500.pt
 
 # Output configuration
 output:
-  path: ../gns-sample/WaterDropSample/rollouts/
+  path: ../ColumnCollapseFrictional/rollouts/
   filename: rollout
 
 # Training configuration
@@ -63,11 +63,10 @@ rendering:
 # Reptile Configuration
 reptile:
   inner_loop:
-    batch_size: 34
-    num_batches: 1
+    n_examples: 2
     iterations: 5
   
   outer_loop:
     batch_size: 5
     step_size: 1
-    iterations: 10000
+    iterations: 10

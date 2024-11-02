@@ -69,7 +69,7 @@ class RenderingConfig:
 
 @dataclass
 class InnerLoopConfig:
-    batch_size: int = 34
+    n_examples: int = 2
     iterations: int = 5
 
 
