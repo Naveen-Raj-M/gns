@@ -892,10 +892,6 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                 # Sample a task
                 example, train_data_iter = sample_task(train_data_iter, train_dl)
 
-                print(np.shape(example))
-                for i in range(len(example)):
-                    print(example[i][2])
-
                 # Prepare data
                 (
                     position,
