@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.optim as optim
 from tqdm import tqdm
 from collections import defaultdict
 
@@ -388,13 +389,22 @@ def initialize_training(cfg, rank, world_size, device, use_dist):
 
 def load_datasets(cfg, use_dist):
     # Train data loader
-    train_dl = pdl.get_data_loader(
-        file_path=f"{cfg.data.path}train.npz",
-        mode="sample",
-        input_sequence_length=cfg.data.input_sequence_length,
-        batch_size=cfg.data.batch_size,
-        use_dist=use_dist,
-    )
+    if cfg.mode == 'train':
+        train_dl = pdl.get_data_loader(
+            file_path=f"{cfg.data.path}train.npz",
+            mode="sample",
+            input_sequence_length=cfg.data.input_sequence_length,
+            batch_size=cfg.data.batch_size,
+            use_dist=use_dist,
+        )
+    elif cfg.mode == 'reptile':
+        train_dl = pdl.get_data_loader(
+            file_path=f"{cfg.data.path}train.npz",
+            mode="sample",
+            input_sequence_length=cfg.data.input_sequence_length,
+            batch_size=cfg.reptile.inner_loop.n_examples,
+            use_dist=use_dist,
+        )
     train_dataset = pdl.ParticleDataset(f"{cfg.data.path}train.npz")
     n_features = train_dataset.get_num_features()
 
@@ -775,6 +785,9 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
         cfg, rank, world_size, device, use_dist
     )
 
+    ## Extract the Encoder from the simulator
+    main_encoder = simulator._encode_process_decode._encoder
+
     # Initialize training state
     step = 0
     steps_per_meta_iter = 0
@@ -785,6 +798,35 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
 
     train_loss_hist = []
     valid_loss_hist = []
+
+    if os.path.exists(cfg.pretrained_model.path + cfg.pretrained_model.file) and os.path.exists(
+    cfg.pretrained_model.path + cfg.pretrained_model.train_state_file
+    ):
+        # load model
+        if use_dist:
+            simulator.module.load(cfg.pretrained_model.path + cfg.pretrained_model.file)
+        else:
+            simulator.load(cfg.pretrained_model.path + cfg.pretrained_model.file)
+
+        # load train state
+        train_state = torch.load(cfg.pretrained_model.path + cfg.pretrained_model.train_state_file)
+
+        # set optimizer state
+        optimizer = torch.optim.Adam(
+            simulator.module.parameters() if use_dist else simulator.parameters()
+        )
+        optimizer.load_state_dict(train_state["optimizer_state"])
+        optimizer_to(optimizer, device_id)
+
+        '''# set global train state
+        step = train_state["global_train_state"]["step"]
+        epoch = train_state["global_train_state"]["epoch"]
+        train_loss_hist = train_state["loss_history"]["train"]
+        valid_loss_hist = train_state["loss_history"]["valid"]'''
+
+    else:
+        msg = f"Specified model_file {cfg.model.path + cfg.model.file} and train_state_file {cfg.model.path + cfg.model.train_state_file} not found."
+        raise FileNotFoundError(msg)
 
     simulator.train()
     simulator.to(device_id)
@@ -797,9 +839,28 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
 
     writer = setup_tensorboard(cfg, metadata) if verbose else None
 
+    ## Initialize encoders for each task
+    task_encoders = defaultdict(lambda: copy.deepcopy(main_encoder))
+
     meta_iters = cfg.reptile.outer_loop.iterations
     if verbose:
         print(f"Total meta iterations = {meta_iters}")
+
+    '''# Freeze the processor and decoder's parameters
+    for param in simulator._encode_process_decode._processor.parameters():
+        param.requires_grad = False
+
+    for param in simulator._encode_process_decode._decoder.parameters():
+        param.requires_grad = False
+
+    # Freeze the _particle_type_embedding.weight parameter
+    simulator._particle_type_embedding.weight.requires_grad = False
+    
+    # Ensure the encoder's parameters are trainable
+    for param in simulator._encode_process_decode._encoder.parameters():
+        param.requires_grad = True'''
+
+    # phi_tildes = []
 
     for meta_iteration in tqdm(
         range(meta_iters), desc="Meta-Training", unit="meta_iters", disable=not verbose
@@ -808,13 +869,8 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
             torch.distributed.barrier()
 
         # Extract the Encoder from the simulator
-        main_encoder = simulator._encode_process_decode._encoder
-        phi = {name: param.clone() for name, param in main_encoder.named_parameters()}
-
-        # Save the encoder's state dictionary before training
-        torch.save(main_encoder.state_dict(), "encoder_before.pth")
-
-        phi_tildes = []
+        # main_encoder = simulator._encode_process_decode._encoder
+        # phi = {name: param.clone() for name, param in main_encoder.named_parameters()}
 
         iter_loss = 0.0
         steps_this_meta_iter = 0
@@ -824,15 +880,21 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
         with tqdm(
             range(steps_this_meta_iter % total_steps, total_steps),
             desc=f"Meta-Iteration {meta_iteration}",
-            unit="batch",
+            unit="step",
             disable=not verbose,
         ) as pbar:
+            
+            material_ids = []
 
             for _ in range(cfg.reptile.outer_loop.batch_size):
                 steps_per_meta_iter += 1
 
                 # Sample a task
                 example, train_data_iter = sample_task(train_data_iter, train_dl)
+
+                print(np.shape(example))
+                for i in range(len(example)):
+                    print(example[i][2])
 
                 # Prepare data
                 (
@@ -863,9 +925,20 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                     if use_dist
                     else simulator.predict_accelerations
                 )
+                
+                ## Identify the material property and use the corresponding encoder
+                material_id = material_property[0].item()
+                task_encoder = task_encoders[material_id]
+                if material_id not in material_ids:
+                    material_ids.append(material_id)
+                task_optimizer = optim.Adam(task_encoder.parameters(), lr=cfg.training.learning_rate.initial)
 
                 # Perform a few steps of gradient descent in the inner loop
                 for _ in range(cfg.reptile.inner_loop.iterations):
+                    ## Replace the simulator's encoder with the task-specific encoder
+                    original_encoder = simulator._encode_process_decode._encoder
+                    simulator._encode_process_decode._encoder = task_encoder
+
                     pred_acc, target_acc = predict_fn(
                         next_positions=labels.to(device_or_rank),
                         position_sequence_noise=sampled_noise.to(device_or_rank),
@@ -874,11 +947,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                             device_or_rank
                         ),
                         particle_types=particle_type.to(device_or_rank),
-                        material_property=(
-                            material_property.to(device_or_rank)
-                            if n_features == 3
-                            else None
-                        ),
+                        material_property=None, ##
                     )
                     if (
                         cfg.training.validation_interval is not None
@@ -903,9 +972,9 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                     iter_loss += train_loss
                     steps_this_meta_iter += 1
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+                    task_optimizer.zero_grad() ##
+                    loss.backward() 
+                    task_optimizer.step() ##
 
                     # Log training loss
                     if verbose:
@@ -936,36 +1005,58 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
 
                     step += 1
 
+                ## Restore the original encoder
+                simulator._encode_process_decode._encoder = original_encoder
+
                 # Extract the Encoder from the simulator after the inner loop
-                phi_tilde = {
+                '''phi_tilde = {
                     name: param.clone()
                     for name, param in main_encoder.named_parameters()
                 }
                 phi_tildes.append(phi_tilde)
 
                 # Replace the simulator's encoder with the phi parameters
-                main_encoder.load_state_dict(torch.load("encoder_before.pth"))
+                main_encoder.load_state_dict(phi)'''
 
-        # Compute the average of phi_tilde
-        avg_phi_tilde = {
-            name: torch.zeros_like(param) for name, param in phi_tildes[0].items()
-        }
+        ## After the inner loop, find the average of the task encoders
+        task_encoders_list = [task_encoders[material_id] for material_id in material_ids]
+        num_encoders = len(task_encoders_list)
+        
+        accumulated_params = {name: torch.zeros_like(param) for name, param in task_encoders_list[0].named_parameters()}
+        
+        for task_encoder in task_encoders_list:
+            for name, param in task_encoder.named_parameters():
+                accumulated_params[name] += param
+        
+        averaged_params = {name: param / num_encoders for name, param in accumulated_params.items()}
+        
+        original_encoder = simulator._encode_process_decode._encoder
+
+        ## Compute the difference and update the original parameters
+        for name, param in original_encoder.named_parameters():
+            difference = param - averaged_params[name]
+            param.data.copy_(param - cfg.reptile.outer_loop.step_size * difference)
+
+        # Restore the updated encoder
+        simulator._encode_process_decode._encoder = original_encoder
+
+        '''# Compute the average of phi_tilde 
+        avg_phi_tilde = {name: param.clone().zero_() for name, param in phi_tildes[0].items()}
         for phi_tilde in phi_tildes:
             for name, param in phi_tilde.items():
-                avg_phi_tilde[name] += param
+                avg_phi_tilde[name].add_(param)
 
         for name in avg_phi_tilde:
-            avg_phi_tilde[name] /= len(phi_tildes)
+            avg_phi_tilde[name].div_(len(phi_tildes))
 
         # Meta update
+        step_size = cfg.reptile.outer_loop.step_size
         for name in phi:
-            phi[name] -= cfg.reptile.outer_loop.step_size * (
-                avg_phi_tilde[name] - phi[name]
-            )
+            phi[name].sub_(step_size * (avg_phi_tilde[name] - phi[name]))
 
         # Replace the main encoder's parameters with the updated phi values
         for name, param in main_encoder.named_parameters():
-            param.data.copy_(phi[name])
+            param.data.copy_(phi[name])'''
 
         # meta iteration level statistics
         avg_loss = torch.tensor([iter_loss / steps_this_meta_iter]).to(device_id)
@@ -988,10 +1079,10 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
             valid_loss_hist.append((meta_iteration, iter_valid_loss.item()))
 
         if verbose:
-            writer.add_scalar("Loss/train_epoch", avg_loss.item(), meta_iteration)
+            writer.add_scalar("Loss/train_iter", avg_loss.item(), meta_iteration)
             if cfg.training.validation_interval is not None:
                 writer.add_scalar(
-                    "Loss/valid_epoch", iter_valid_loss.item(), meta_iteration
+                    "Loss/valid_train_iter", iter_valid_loss.item(), meta_iteration
                 )
 
 
