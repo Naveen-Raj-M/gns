@@ -85,6 +85,12 @@ class ReptileConfig:
     inner_loop: InnerLoopConfig = field(default_factory=InnerLoopConfig)
     outer_loop: OuterLoopConfig = field(default_factory=OuterLoopConfig)
 
+@dataclass
+class PretrainedModelConfig:
+    path: str = "models/"
+    file: Optional[str] = None
+    train_state_file: Optional[str] = None
+
 
 @dataclass
 class Config:
@@ -97,7 +103,7 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     rendering: RenderingConfig = field(default_factory=RenderingConfig)
     reptile: ReptileConfig = field(default_factory=ReptileConfig)
-
+    pretrained_model: PretrainedModelConfig = field(default_factory=PretrainedModelConfig)
 
 # Hydra configuration
 cs = ConfigStore.instance()

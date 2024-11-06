@@ -22,9 +22,9 @@ data:
 
 # Model configuration
 model:
-  path: ../ColumnCollapseFrictional/models/
-  file: model-1500.pt
-  train_state_file: train_state-1500.pt
+  path: ../ColumnCollapseFrictional/reptile_models_frozen/
+  file: null
+  train_state_file: null
 
 # Output configuration
 output:
@@ -69,4 +69,10 @@ reptile:
   outer_loop:
     batch_size: 5
     step_size: 1
-    iterations: 10
+    iterations: 1
+
+# Pretrained-Model configuration
+pretrained_model:
+  path: ../ColumnCollapseSimple/models/
+  file: model.pt
+  train_state_file: train_state.pt
