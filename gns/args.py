@@ -82,6 +82,7 @@ class OuterLoopConfig:
 
 @dataclass
 class ReptileConfig:
+    n_task: int = 3
     inner_loop: InnerLoopConfig = field(default_factory=InnerLoopConfig)
     outer_loop: OuterLoopConfig = field(default_factory=OuterLoopConfig)
 

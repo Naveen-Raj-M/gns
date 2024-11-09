@@ -13,8 +13,8 @@ mode: reptile
 
 # Data configuration
 data:
-  path: ../ColumnCollapseFrictional/datasets/
-  batch_size: 2
+  path: ../ColumnCollapseFrictional/reptile_datasets/
+  batch_size: 3
   noise_std: 6.7e-4
   input_sequence_length: 6
   num_particle_types: 9
@@ -22,13 +22,13 @@ data:
 
 # Model configuration
 model:
-  path: ../ColumnCollapseFrictional/reptile_models_frozen/
+  path: ../ColumnCollapseFrictional/reptile_models/
   file: null
   train_state_file: null
 
 # Output configuration
 output:
-  path: ../ColumnCollapseFrictional/rollouts/
+  path: ../ColumnCollapseFrictional/reptile_rollouts/
   filename: rollout
 
 # Training configuration
@@ -62,14 +62,15 @@ rendering:
 
 # Reptile Configuration
 reptile:
+  n_task: 3
   inner_loop:
-    n_examples: 2
+    n_examples: 3
     iterations: 5
   
   outer_loop:
     batch_size: 5
     step_size: 1
-    iterations: 1
+    iterations: 10000
 
 # Pretrained-Model configuration
 pretrained_model:
