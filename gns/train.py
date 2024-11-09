@@ -398,14 +398,18 @@ def load_datasets(cfg, use_dist):
             use_dist=use_dist,
         )
     elif cfg.mode == 'reptile':
-        train_dl = pdl.get_data_loader(
-            file_path=f"{cfg.data.path}train.npz",
-            mode="sample",
-            input_sequence_length=cfg.data.input_sequence_length,
-            batch_size=cfg.reptile.inner_loop.n_examples,
-            use_dist=use_dist,
-        )
-    train_dataset = pdl.ParticleDataset(f"{cfg.data.path}train.npz")
+        train_dl = []
+        for i in range(cfg.reptile.n_task):
+            train_dl_i = pdl.get_data_loader(
+                file_path=f"{cfg.data.path}train_{i}.npz",
+                mode="sample",
+                input_sequence_length=cfg.data.input_sequence_length,
+                batch_size=cfg.reptile.inner_loop.n_examples,
+                use_dist=use_dist,
+            )
+            train_dl.append(train_dl_i)
+        
+    train_dataset = pdl.ParticleDataset(f"{cfg.data.path}train_0.npz")
     n_features = train_dataset.get_num_features()
 
     # Validation data loader
@@ -427,16 +431,26 @@ def load_datasets(cfg, use_dist):
     return train_dl, valid_dl, n_features
 
 
-def sample_task(data_iter, train_dl):
+def sample_task(cfg, task_data_iters, train_dl):
     """Extract one example sequentially from the DataLoader."""
+    # Choose a random task number
+    task_no = torch.randint(0, cfg.reptile.n_task, (1,)).item()
+
+    # Get the iterator for the chosen task
+    data_iter = task_data_iters[task_no]
+
     try:
-        # Extract one example sequentially from train_dl
+        # Extract one example sequentially from task_train_dl
         example = next(data_iter)
     except StopIteration:
         # If the DataLoader is exhausted, reinitialize the iterator
-        data_iter = iter(train_dl)
+        data_iter = iter(train_dl[task_no])
         example = next(data_iter)
-    return example, data_iter
+
+    # Update the iterator in the dictionary
+    task_data_iters[task_no] = data_iter
+
+    return example, task_data_iters
 
 
 def setup_tensorboard(cfg, metadata):
@@ -785,7 +799,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
         cfg, rank, world_size, device, use_dist
     )
 
-    ## Extract the Encoder from the simulator
+    # Extract the Encoder from the simulator
     main_encoder = simulator._encode_process_decode._encoder
 
     # Initialize training state
@@ -799,7 +813,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
     train_loss_hist = []
     valid_loss_hist = []
 
-    if os.path.exists(cfg.pretrained_model.path + cfg.pretrained_model.file) and os.path.exists(
+    '''if os.path.exists(cfg.pretrained_model.path + cfg.pretrained_model.file) and os.path.exists(
     cfg.pretrained_model.path + cfg.pretrained_model.train_state_file
     ):
         # load model
@@ -818,29 +832,32 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
         optimizer.load_state_dict(train_state["optimizer_state"])
         optimizer_to(optimizer, device_id)
 
-        '''# set global train state
+        # set global train state
         step = train_state["global_train_state"]["step"]
         epoch = train_state["global_train_state"]["epoch"]
         train_loss_hist = train_state["loss_history"]["train"]
-        valid_loss_hist = train_state["loss_history"]["valid"]'''
+        valid_loss_hist = train_state["loss_history"]["valid"]
+        
 
     else:
         msg = f"Specified model_file {cfg.model.path + cfg.model.file} and train_state_file {cfg.model.path + cfg.model.train_state_file} not found."
         raise FileNotFoundError(msg)
-
+    '''
+    
+    # Extract the Encoder from the simulator and initalize Encoders for each task
+    main_encoder = simulator._encode_process_decode._encoder
+    task_encoders = defaultdict(lambda: copy.deepcopy(main_encoder))
+    
     simulator.train()
     simulator.to(device_id)
 
-    # Load datasets
+    # Load datasets and initialize a dictionary for task-specific iterators
     train_dl, valid_dl, n_features = load_datasets(cfg, use_dist)
-    train_data_iter = iter(train_dl)
+    task_data_iters = {task_no: iter(dl) for task_no, dl in enumerate(train_dl)}
 
     print(f"rank = {rank}, cuda = {torch.cuda.is_available()}")
 
     writer = setup_tensorboard(cfg, metadata) if verbose else None
-
-    ## Initialize encoders for each task
-    task_encoders = defaultdict(lambda: copy.deepcopy(main_encoder))
 
     meta_iters = cfg.reptile.outer_loop.iterations
     if verbose:
@@ -862,224 +879,260 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
 
     # phi_tildes = []
 
-    for meta_iteration in tqdm(
-        range(meta_iters), desc="Meta-Training", unit="meta_iters", disable=not verbose
-    ):
-        if use_dist:
-            torch.distributed.barrier()
+    try:
+        for meta_iteration in tqdm(
+            range(meta_iters), desc="Meta-Training", unit="meta_iters", disable=not verbose
+        ):
+            if use_dist:
+                torch.distributed.barrier()
 
-        # Extract the Encoder from the simulator
-        # main_encoder = simulator._encode_process_decode._encoder
-        # phi = {name: param.clone() for name, param in main_encoder.named_parameters()}
+            # Extract the Encoder from the simulator
+            # main_encoder = simulator._encode_process_decode._encoder
+            # phi = {name: param.clone() for name, param in main_encoder.named_parameters()}
 
-        iter_loss = 0.0
-        steps_this_meta_iter = 0
-        total_steps = (
-            cfg.reptile.outer_loop.batch_size * cfg.reptile.inner_loop.iterations
-        )
-        with tqdm(
-            range(steps_this_meta_iter % total_steps, total_steps),
-            desc=f"Meta-Iteration {meta_iteration}",
-            unit="step",
-            disable=not verbose,
-        ) as pbar:
-            
-            material_ids = []
-
-            for _ in range(cfg.reptile.outer_loop.batch_size):
-                steps_per_meta_iter += 1
-
-                # Sample a task
-                example, train_data_iter = sample_task(train_data_iter, train_dl)
-
-                # Prepare data
-                (
-                    position,
-                    particle_type,
-                    material_property,
-                    n_particles_per_example,
-                    labels,
-                ) = prepare_data(example, device_id)
-
-                n_particles_per_example = n_particles_per_example.to(device_id)
-                labels = labels.to(device_id)
-
-                sampled_noise = noise_utils.get_random_walk_noise_for_position_sequence(
-                    position, noise_std_last_step=cfg.data.noise_std
-                ).to(device_id)
-                non_kinematic_mask = (
-                    (particle_type != cfg.data.kinematic_particle_id)
-                    .clone()
-                    .detach()
-                    .to(device_id)
-                )
-                sampled_noise *= non_kinematic_mask.view(-1, 1, 1)
-
-                device_or_rank = rank if device == torch.device("cuda") else device
-                predict_fn = (
-                    simulator.module.predict_accelerations
-                    if use_dist
-                    else simulator.predict_accelerations
-                )
-                
-                ## Identify the material property and use the corresponding encoder
-                material_id = material_property[0].item()
-                task_encoder = task_encoders[material_id]
-                if material_id not in material_ids:
-                    material_ids.append(material_id)
-                task_optimizer = optim.Adam(task_encoder.parameters(), lr=cfg.training.learning_rate.initial)
-
-                # Perform a few steps of gradient descent in the inner loop
-                for _ in range(cfg.reptile.inner_loop.iterations):
-                    ## Replace the simulator's encoder with the task-specific encoder
-                    original_encoder = simulator._encode_process_decode._encoder
-                    simulator._encode_process_decode._encoder = task_encoder
-
-                    pred_acc, target_acc = predict_fn(
-                        next_positions=labels.to(device_or_rank),
-                        position_sequence_noise=sampled_noise.to(device_or_rank),
-                        position_sequence=position.to(device_or_rank),
-                        nparticles_per_example=n_particles_per_example.to(
-                            device_or_rank
-                        ),
-                        particle_types=particle_type.to(device_or_rank),
-                        material_property=None, ##
-                    )
-                    if (
-                        cfg.training.validation_interval is not None
-                        and step > 0
-                        and step % cfg.training.validation_interval == 0
-                    ):
-                        if verbose:
-                            sampled_valid_example = next(iter(valid_dl))
-                            valid_loss = validation(
-                                simulator,
-                                sampled_valid_example,
-                                n_features,
-                                cfg,
-                                rank,
-                                device_id,
-                            )
-                            writer.add_scalar("Loss/valid", valid_loss.item(), step)
-
-                    loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
-
-                    train_loss = loss.item()
-                    iter_loss += train_loss
-                    steps_this_meta_iter += 1
-
-                    task_optimizer.zero_grad() ##
-                    loss.backward() 
-                    task_optimizer.step() ##
-
-                    # Log training loss
-                    if verbose:
-                        writer.add_scalar("Loss/train", train_loss, step)
-
-                    avg_loss = iter_loss / steps_this_meta_iter
-                    pbar.set_postfix(
-                        loss=f"{train_loss:.2f}",
-                        avg_loss=f"{avg_loss:.2f}",
-                    )
-                    pbar.update(1)
-
-                    if verbose and step % cfg.training.save_steps == 0:
-                        save_model_and_train_state(
-                            verbose,
-                            device,
-                            simulator,
-                            cfg,
-                            step,
-                            meta_iteration,
-                            optimizer,
-                            train_loss,
-                            valid_loss,
-                            train_loss_hist,
-                            valid_loss_hist,
-                            use_dist,
-                        )
-
-                    step += 1
-
-                ## Restore the original encoder
-                simulator._encode_process_decode._encoder = original_encoder
-
-                # Extract the Encoder from the simulator after the inner loop
-                '''phi_tilde = {
-                    name: param.clone()
-                    for name, param in main_encoder.named_parameters()
-                }
-                phi_tildes.append(phi_tilde)
-
-                # Replace the simulator's encoder with the phi parameters
-                main_encoder.load_state_dict(phi)'''
-
-        ## After the inner loop, find the average of the task encoders
-        task_encoders_list = [task_encoders[material_id] for material_id in material_ids]
-        num_encoders = len(task_encoders_list)
-        
-        accumulated_params = {name: torch.zeros_like(param) for name, param in task_encoders_list[0].named_parameters()}
-        
-        for task_encoder in task_encoders_list:
-            for name, param in task_encoder.named_parameters():
-                accumulated_params[name] += param
-        
-        averaged_params = {name: param / num_encoders for name, param in accumulated_params.items()}
-        
-        original_encoder = simulator._encode_process_decode._encoder
-
-        ## Compute the difference and update the original parameters
-        for name, param in original_encoder.named_parameters():
-            difference = param - averaged_params[name]
-            param.data.copy_(param - cfg.reptile.outer_loop.step_size * difference)
-
-        # Restore the updated encoder
-        simulator._encode_process_decode._encoder = original_encoder
-
-        '''# Compute the average of phi_tilde 
-        avg_phi_tilde = {name: param.clone().zero_() for name, param in phi_tildes[0].items()}
-        for phi_tilde in phi_tildes:
-            for name, param in phi_tilde.items():
-                avg_phi_tilde[name].add_(param)
-
-        for name in avg_phi_tilde:
-            avg_phi_tilde[name].div_(len(phi_tildes))
-
-        # Meta update
-        step_size = cfg.reptile.outer_loop.step_size
-        for name in phi:
-            phi[name].sub_(step_size * (avg_phi_tilde[name] - phi[name]))
-
-        # Replace the main encoder's parameters with the updated phi values
-        for name, param in main_encoder.named_parameters():
-            param.data.copy_(phi[name])'''
-
-        # meta iteration level statistics
-        avg_loss = torch.tensor([iter_loss / steps_this_meta_iter]).to(device_id)
-        if use_dist:
-            torch.distributed.reduce(avg_loss, dst=0, op=torch.distributed.ReduceOp.SUM)
-            avg_loss /= world_size
-
-        train_loss_hist.append((meta_iteration, avg_loss.item()))
-
-        if cfg.training.validation_interval is not None:
-            sampled_valid_example = next(iter(valid_dl))
-            iter_valid_loss = validation(
-                simulator, sampled_valid_example, n_features, cfg, rank, device_id
+            iter_loss = 0.0
+            steps_this_meta_iter = 0
+            total_steps = (
+                cfg.reptile.outer_loop.batch_size * cfg.reptile.inner_loop.iterations
             )
-            if device == torch.device("cuda"):
-                torch.distributed.reduce(
-                    iter_valid_loss, dst=0, op=torch.distributed.ReduceOp.SUM
-                )
-                iter_valid_loss /= world_size
-            valid_loss_hist.append((meta_iteration, iter_valid_loss.item()))
+            with tqdm(
+                range(steps_this_meta_iter % total_steps, total_steps),
+                desc=f"Meta-Iteration {meta_iteration}",
+                unit="step",
+                disable=not verbose,
+            ) as pbar:
+                
+                material_ids = []
 
-        if verbose:
-            writer.add_scalar("Loss/train_iter", avg_loss.item(), meta_iteration)
+                for _ in range(cfg.reptile.outer_loop.batch_size):
+                    steps_per_meta_iter += 1
+
+                    # Sample a task
+                    example, task_data_iters = sample_task(cfg, task_data_iters, train_dl)
+
+                    # Prepare data
+                    (
+                        position,
+                        particle_type,
+                        material_property,
+                        n_particles_per_example,
+                        labels,
+                    ) = prepare_data(example, device_id)
+
+                    n_particles_per_example = n_particles_per_example.to(device_id)
+                    labels = labels.to(device_id)
+
+                    sampled_noise = noise_utils.get_random_walk_noise_for_position_sequence(
+                        position, noise_std_last_step=cfg.data.noise_std
+                    ).to(device_id)
+                    non_kinematic_mask = (
+                        (particle_type != cfg.data.kinematic_particle_id)
+                        .clone()
+                        .detach()
+                        .to(device_id)
+                    )
+                    sampled_noise *= non_kinematic_mask.view(-1, 1, 1)
+
+                    device_or_rank = rank if device == torch.device("cuda") else device
+                    predict_fn = (
+                        simulator.module.predict_accelerations
+                        if use_dist
+                        else simulator.predict_accelerations
+                    )
+                    
+                    # Identify the material property and use the corresponding encoder
+                    material_id = material_property[0].item()
+                    task_encoder = task_encoders[material_id]
+                    
+                    if material_id not in material_ids:
+                        material_ids.append(material_id)
+                    
+                    task_optimizer = optim.Adam(task_encoder.parameters(), lr=cfg.training.learning_rate.initial)
+
+                    # Perform a few steps of gradient descent in the inner loop
+                    for _ in range(cfg.reptile.inner_loop.iterations):
+                        # Replace the simulator's encoder with the task-specific encoder
+                        original_encoder = simulator._encode_process_decode._encoder
+                        simulator._encode_process_decode._encoder = task_encoder
+
+                        pred_acc, target_acc = predict_fn(
+                            next_positions=labels.to(device_or_rank),
+                            position_sequence_noise=sampled_noise.to(device_or_rank),
+                            position_sequence=position.to(device_or_rank),
+                            nparticles_per_example=n_particles_per_example.to(
+                                device_or_rank
+                            ),
+                            particle_types=particle_type.to(device_or_rank),
+                            material_property=(
+                            material_property.to(device_or_rank)
+                                if n_features == 3
+                                else None
+                            ),
+                        )
+                        if (
+                            cfg.training.validation_interval is not None
+                            and step > 0
+                            and step % cfg.training.validation_interval == 0
+                        ):
+                            if verbose:
+                                sampled_valid_example = next(iter(valid_dl))
+                                valid_loss = validation(
+                                    simulator,
+                                    sampled_valid_example,
+                                    n_features,
+                                    cfg,
+                                    rank,
+                                    device_id,
+                                )
+                                writer.add_scalar("Loss/valid", valid_loss.item(), step)
+
+                        loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
+
+                        train_loss = loss.item()
+                        iter_loss += train_loss
+                        steps_this_meta_iter += 1
+
+                        task_optimizer.zero_grad()
+                        loss.backward() 
+                        task_optimizer.step()
+
+                        # Log training loss
+                        if verbose:
+                            writer.add_scalar("Loss/train", train_loss, step)
+
+                        avg_loss = iter_loss / steps_this_meta_iter
+                        pbar.set_postfix(
+                            loss=f"{train_loss:.2f}",
+                            avg_loss=f"{avg_loss:.2f}",
+                        )
+                        pbar.update(1)
+
+                        if verbose and step % cfg.training.save_steps == 0:
+                            save_model_and_train_state(
+                                verbose,
+                                device,
+                                simulator,
+                                cfg,
+                                step,
+                                meta_iteration,
+                                optimizer,
+                                train_loss,
+                                valid_loss,
+                                train_loss_hist,
+                                valid_loss_hist,
+                                use_dist,
+                            )
+
+                        step += 1
+
+                    # Restore the original encoder
+                    simulator._encode_process_decode._encoder = original_encoder
+
+                    # Extract the Encoder from the simulator after the inner loop
+                    '''phi_tilde = {
+                        name: param.clone()
+                        for name, param in main_encoder.named_parameters()
+                    }
+                    phi_tildes.append(phi_tilde)
+
+                    # Replace the simulator's encoder with the phi parameters
+                    main_encoder.load_state_dict(phi)'''
+
+            # After the inner loop, find the average of the task encoders
+            task_encoders_list = [task_encoders[material_id] for material_id in material_ids]
+            num_encoders = len(task_encoders_list)
+            
+            accumulated_params = {name: torch.zeros_like(param) for name, param in task_encoders_list[0].named_parameters()}
+            
+            for task_encoder in task_encoders_list:
+                for name, param in task_encoder.named_parameters():
+                    accumulated_params[name] += param
+            
+            averaged_params = {name: param / num_encoders for name, param in accumulated_params.items()}
+            
+            original_encoder = simulator._encode_process_decode._encoder
+
+            # Compute the difference and update the original parameters
+            for name, param in original_encoder.named_parameters():
+                difference = param - averaged_params[name]
+                param.data.copy_(param - cfg.reptile.outer_loop.step_size * difference)
+
+            # Restore the updated encoder
+            simulator._encode_process_decode._encoder = original_encoder
+
+            # Update task_encoders with the original_encoder
+            for key in task_encoders.keys():
+                task_encoders[key] = copy.deepcopy(original_encoder)
+
+            '''# Compute the average of phi_tilde 
+            avg_phi_tilde = {name: param.clone().zero_() for name, param in phi_tildes[0].items()}
+            for phi_tilde in phi_tildes:
+                for name, param in phi_tilde.items():
+                    avg_phi_tilde[name].add_(param)
+
+            for name in avg_phi_tilde:
+                avg_phi_tilde[name].div_(len(phi_tildes))
+
+            # Meta update
+            step_size = cfg.reptile.outer_loop.step_size
+            for name in phi:
+                phi[name].sub_(step_size * (avg_phi_tilde[name] - phi[name]))
+
+            # Replace the main encoder's parameters with the updated phi values
+            for name, param in main_encoder.named_parameters():
+                param.data.copy_(phi[name])'''
+
+            # meta iteration level statistics
+            avg_loss = torch.tensor([iter_loss / steps_this_meta_iter]).to(device_id)
+            if use_dist:
+                torch.distributed.reduce(avg_loss, dst=0, op=torch.distributed.ReduceOp.SUM)
+                avg_loss /= world_size
+
+            train_loss_hist.append((meta_iteration, avg_loss.item()))
+
             if cfg.training.validation_interval is not None:
-                writer.add_scalar(
-                    "Loss/valid_train_iter", iter_valid_loss.item(), meta_iteration
+                sampled_valid_example = next(iter(valid_dl))
+                iter_valid_loss = validation(
+                    simulator, sampled_valid_example, n_features, cfg, rank, device_id
                 )
+                if device == torch.device("cuda"):
+                    torch.distributed.reduce(
+                        iter_valid_loss, dst=0, op=torch.distributed.ReduceOp.SUM
+                    )
+                    iter_valid_loss /= world_size
+                valid_loss_hist.append((meta_iteration, iter_valid_loss.item()))
+
+            if verbose:
+                writer.add_scalar("Loss/train_iter", avg_loss.item(), meta_iteration)
+                if cfg.training.validation_interval is not None:
+                    writer.add_scalar(
+                        "Loss/valid_train_iter", iter_valid_loss.item(), meta_iteration
+                    )
+
+    except KeyboardInterrupt:
+        pass
+
+    # Save model state on keyboard interrupt
+    save_model_and_train_state(
+        verbose,
+        device,
+        simulator,
+        cfg,
+        step,
+        meta_iteration,
+        optimizer,
+        train_loss,
+        valid_loss,
+        train_loss_hist,
+        valid_loss_hist,
+        use_dist,
+    )
+
+    if verbose:
+        writer.close()
+
+    if use_dist:
+        distribute.cleanup()
 
 
 def _get_simulator(
