@@ -203,9 +203,9 @@ def predict(device: str, cfg: DictConfig):
             if cfg.mode == "rollout":
                 example_rollout["metadata"] = metadata
                 example_rollout["loss"] = loss.mean()
-                filename = f"{cfg.output.filename}_ex{example_i}.pkl"
-                filename_render = f"{cfg.output.filename}_ex{example_i}"
-                filename = os.path.join(cfg.output.path, filename_render)
+                filename = f"{cfg.output.filename}_{example_i}_ex0.pkl"
+                filename_render = f"{cfg.output.filename}_{example_i}_ex0"
+                filename = os.path.join(cfg.output.path, filename)
                 with open(filename, "wb") as f:
                     pickle.dump(example_rollout, f)
             if cfg.rendering.mode:
@@ -397,6 +397,7 @@ def load_datasets(cfg, use_dist):
             batch_size=cfg.data.batch_size,
             use_dist=use_dist,
         )
+        train_dataset = pdl.ParticleDataset(f"{cfg.data.path}train.npz")
     elif cfg.mode == 'reptile':
         train_dl = []
         for i in range(cfg.reptile.n_task):
@@ -408,8 +409,8 @@ def load_datasets(cfg, use_dist):
                 use_dist=use_dist,
             )
             train_dl.append(train_dl_i)
-        
-    train_dataset = pdl.ParticleDataset(f"{cfg.data.path}train_0.npz")
+        train_dataset = pdl.ParticleDataset(f"{cfg.data.path}train_0.npz")
+    
     n_features = train_dataset.get_num_features()
 
     # Validation data loader
@@ -583,10 +584,16 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
 
     writer = setup_tensorboard(cfg, metadata) if verbose else None
 
+    step = 0
+    epoch = 0
+    steps_per_epoch = 0
+
     try:
-        num_epochs = max(1, (cfg.training.steps + len(train_dl) - 1) // len(train_dl))
+        num_epochs = + max(1, (cfg.training.steps + len(train_dl) - 1) // len(train_dl))
         if verbose:
             print(f"Total epochs = {num_epochs}")
+        
+        num_epochs += epoch
         for epoch in tqdm(
             range(epoch, num_epochs), desc="Training", unit="epoch", disable=not verbose
         ):
@@ -666,6 +673,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                                 cfg,
                                 rank,
                                 device_id,
+                                use_dist
                             )
                             writer.add_scalar("Loss/valid", valid_loss.item(), step)
 
@@ -736,7 +744,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
             if cfg.training.validation_interval is not None:
                 sampled_valid_example = next(iter(valid_dl))
                 epoch_valid_loss = validation(
-                    simulator, sampled_valid_example, n_features, cfg, rank, device_id
+                    simulator, sampled_valid_example, n_features, cfg, rank, device_id, use_dist
                 )
                 if device == torch.device("cuda"):
                     torch.distributed.reduce(
@@ -799,9 +807,6 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
         cfg, rank, world_size, device, use_dist
     )
 
-    # Extract the Encoder from the simulator
-    main_encoder = simulator._encode_process_decode._encoder
-
     # Initialize training state
     step = 0
     steps_per_meta_iter = 0
@@ -813,7 +818,48 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
     train_loss_hist = []
     valid_loss_hist = []
 
-    '''if os.path.exists(cfg.pretrained_model.path + cfg.pretrained_model.file) and os.path.exists(
+    # If model_path does exist and model_file and train_state_file exist continue training.
+    if cfg.model.file is not None and cfg.training.resume:
+        if cfg.model.file == "latest" and cfg.model.train_state_file == "latest":
+            # find the latest model, assumes model and train_state files are in step.
+            fnames = glob.glob(f"{cfg.model.path}*model*pt")
+            max_model_number = 0
+            expr = re.compile(".*model-(\d+).pt")
+            for fname in fnames:
+                model_num = int(expr.search(fname).groups()[0])
+                if model_num > max_model_number:
+                    max_model_number = model_num
+            # reset names to point to the latest.
+            cfg.model.file = f"model-{max_model_number}.pt"
+            cfg.model.train_state_file = f"train_state-{max_model_number}.pt"
+
+        if os.path.exists(cfg.model.path + cfg.model.file) and os.path.exists(
+            cfg.model.path + cfg.model.train_state_file
+        ):
+            # load model
+            if use_dist:
+                simulator.module.load(cfg.model.path + cfg.model.file)
+            else:
+                simulator.load(cfg.model.path + cfg.model.file)
+
+            # load train state
+            train_state = torch.load(cfg.model.path + cfg.model.train_state_file)
+
+            # set optimizer state
+            optimizer = torch.optim.Adam(
+                simulator.module.parameters() if use_dist else simulator.parameters()
+            )
+            optimizer.load_state_dict(train_state["optimizer_state"])
+            optimizer_to(optimizer, device_id)
+
+            # set global train state
+            step = train_state["global_train_state"]["step"]
+
+        else:
+            msg = f"Specified model_file {cfg.model.path + cfg.model.file} and train_state_file {cfg.model.path + cfg.model.train_state_file} not found."
+            raise FileNotFoundError(msg)
+        
+    elif os.path.exists(cfg.pretrained_model.path + cfg.pretrained_model.file) and os.path.exists(
     cfg.pretrained_model.path + cfg.pretrained_model.train_state_file
     ):
         # load model
@@ -821,28 +867,9 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
             simulator.module.load(cfg.pretrained_model.path + cfg.pretrained_model.file)
         else:
             simulator.load(cfg.pretrained_model.path + cfg.pretrained_model.file)
-
-        # load train state
-        train_state = torch.load(cfg.pretrained_model.path + cfg.pretrained_model.train_state_file)
-
-        # set optimizer state
-        optimizer = torch.optim.Adam(
-            simulator.module.parameters() if use_dist else simulator.parameters()
-        )
-        optimizer.load_state_dict(train_state["optimizer_state"])
-        optimizer_to(optimizer, device_id)
-
-        # set global train state
-        step = train_state["global_train_state"]["step"]
-        epoch = train_state["global_train_state"]["epoch"]
-        train_loss_hist = train_state["loss_history"]["train"]
-        valid_loss_hist = train_state["loss_history"]["valid"]
-        
-
     else:
-        msg = f"Specified model_file {cfg.model.path + cfg.model.file} and train_state_file {cfg.model.path + cfg.model.train_state_file} not found."
+        msg = f"Specified model_file {cfg.pretrained_model.path + cfg.pretrained_model.file} and train_state_file {cfg.pretrained_model.path + cfg.pretrained_model.train_state_file} not found."
         raise FileNotFoundError(msg)
-    '''
     
     # Extract the Encoder from the simulator and initalize Encoders for each task
     main_encoder = simulator._encode_process_decode._encoder
@@ -863,21 +890,6 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
     if verbose:
         print(f"Total meta iterations = {meta_iters}")
 
-    '''# Freeze the processor and decoder's parameters
-    for param in simulator._encode_process_decode._processor.parameters():
-        param.requires_grad = False
-
-    for param in simulator._encode_process_decode._decoder.parameters():
-        param.requires_grad = False
-
-    # Freeze the _particle_type_embedding.weight parameter
-    simulator._particle_type_embedding.weight.requires_grad = False
-    
-    # Ensure the encoder's parameters are trainable
-    for param in simulator._encode_process_decode._encoder.parameters():
-        param.requires_grad = True'''
-
-    # phi_tildes = []
 
     try:
         for meta_iteration in tqdm(
@@ -885,10 +897,6 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
         ):
             if use_dist:
                 torch.distributed.barrier()
-
-            # Extract the Encoder from the simulator
-            # main_encoder = simulator._encode_process_decode._encoder
-            # phi = {name: param.clone() for name, param in main_encoder.named_parameters()}
 
             iter_loss = 0.0
             steps_this_meta_iter = 0
@@ -943,6 +951,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                     # Identify the material property and use the corresponding encoder
                     material_id = material_property[0].item()
                     task_encoder = task_encoders[material_id]
+                    original_encoder = simulator._encode_process_decode._encoder
                     
                     if material_id not in material_ids:
                         material_ids.append(material_id)
@@ -952,7 +961,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                     # Perform a few steps of gradient descent in the inner loop
                     for _ in range(cfg.reptile.inner_loop.iterations):
                         # Replace the simulator's encoder with the task-specific encoder
-                        original_encoder = simulator._encode_process_decode._encoder
+                        # original_encoder = simulator._encode_process_decode._encoder
                         simulator._encode_process_decode._encoder = task_encoder
 
                         pred_acc, target_acc = predict_fn(
@@ -963,11 +972,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                                 device_or_rank
                             ),
                             particle_types=particle_type.to(device_or_rank),
-                            material_property=(
-                            material_property.to(device_or_rank)
-                                if n_features == 3
-                                else None
-                            ),
+                            material_property=None,
                         )
                         if (
                             cfg.training.validation_interval is not None
@@ -983,6 +988,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                                     cfg,
                                     rank,
                                     device_id,
+                                    use_dist
                                 )
                                 writer.add_scalar("Loss/valid", valid_loss.item(), step)
 
@@ -996,14 +1002,28 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                         loss.backward() 
                         task_optimizer.step()
 
+                        lr_new = (
+                        cfg.training.learning_rate.initial
+                        * (
+                            cfg.training.learning_rate.decay
+                            ** (step / cfg.training.learning_rate.decay_steps)
+                        )
+                        * world_size
+                        )
+
+                        for param in task_optimizer.param_groups:
+                            param["lr"] = lr_new
+
                         # Log training loss
                         if verbose:
                             writer.add_scalar("Loss/train", train_loss, step)
+                            writer.add_scalar("Learning Rate", lr_new, step)
 
                         avg_loss = iter_loss / steps_this_meta_iter
                         pbar.set_postfix(
                             loss=f"{train_loss:.2f}",
                             avg_loss=f"{avg_loss:.2f}",
+                            lr=f"{lr_new:.2e}",
                         )
                         pbar.update(1)
 
@@ -1027,16 +1047,6 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
 
                     # Restore the original encoder
                     simulator._encode_process_decode._encoder = original_encoder
-
-                    # Extract the Encoder from the simulator after the inner loop
-                    '''phi_tilde = {
-                        name: param.clone()
-                        for name, param in main_encoder.named_parameters()
-                    }
-                    phi_tildes.append(phi_tilde)
-
-                    # Replace the simulator's encoder with the phi parameters
-                    main_encoder.load_state_dict(phi)'''
 
             # After the inner loop, find the average of the task encoders
             task_encoders_list = [task_encoders[material_id] for material_id in material_ids]
@@ -1064,24 +1074,6 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
             for key in task_encoders.keys():
                 task_encoders[key] = copy.deepcopy(original_encoder)
 
-            '''# Compute the average of phi_tilde 
-            avg_phi_tilde = {name: param.clone().zero_() for name, param in phi_tildes[0].items()}
-            for phi_tilde in phi_tildes:
-                for name, param in phi_tilde.items():
-                    avg_phi_tilde[name].add_(param)
-
-            for name in avg_phi_tilde:
-                avg_phi_tilde[name].div_(len(phi_tildes))
-
-            # Meta update
-            step_size = cfg.reptile.outer_loop.step_size
-            for name in phi:
-                phi[name].sub_(step_size * (avg_phi_tilde[name] - phi[name]))
-
-            # Replace the main encoder's parameters with the updated phi values
-            for name, param in main_encoder.named_parameters():
-                param.data.copy_(phi[name])'''
-
             # meta iteration level statistics
             avg_loss = torch.tensor([iter_loss / steps_this_meta_iter]).to(device_id)
             if use_dist:
@@ -1093,7 +1085,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
             if cfg.training.validation_interval is not None:
                 sampled_valid_example = next(iter(valid_dl))
                 iter_valid_loss = validation(
-                    simulator, sampled_valid_example, n_features, cfg, rank, device_id
+                    simulator, sampled_valid_example, n_features, cfg, rank, device_id, use_dist
                 )
                 if device == torch.device("cuda"):
                     torch.distributed.reduce(
@@ -1200,7 +1192,7 @@ def _get_simulator(
     return simulator
 
 
-def validation(simulator, example, n_features, cfg, rank, device_id):
+def validation(simulator, example, n_features, cfg, rank, device_id, use_dist):
     (
         position,
         particle_type,
@@ -1223,7 +1215,7 @@ def validation(simulator, example, n_features, cfg, rank, device_id):
     # Select the appropriate prediction function
     predict_accelerations = (
         simulator.module.predict_accelerations
-        if isinstance(device_id, int)
+        if use_dist
         else simulator.predict_accelerations
     )
     # Get the predictions and target accelerations
