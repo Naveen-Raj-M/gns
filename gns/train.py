@@ -416,42 +416,58 @@ def load_datasets(cfg, use_dist):
     # Validation data loader
     valid_dl = None
     if cfg.training.validation_interval is not None:
-        valid_dl = pdl.get_data_loader(
-            file_path=f"{cfg.data.path}valid.npz",
-            mode="sample",
-            input_sequence_length=cfg.data.input_sequence_length,
-            batch_size=cfg.data.batch_size,
-            use_dist=use_dist,
-        )
-        valid_dataset = pdl.ParticleDataset(f"{cfg.data.path}valid.npz")
+        if cfg.mode == 'train':
+            valid_dl = pdl.get_data_loader(
+                file_path=f"{cfg.data.path}valid.npz",
+                mode="sample",
+                input_sequence_length=cfg.data.input_sequence_length,
+                batch_size=cfg.data.batch_size,
+                use_dist=use_dist,
+            )
+            valid_dataset = pdl.ParticleDataset(f"{cfg.data.path}train.npz")
+        
+        elif cfg.mode == 'reptile':
+            valid_dl = []
+            for i in range(cfg.reptile.n_task):
+                valid_dl_i = pdl.get_data_loader(
+                    file_path=f"{cfg.data.path}train_{i}.npz",
+                    mode="sample",
+                    input_sequence_length=cfg.data.input_sequence_length,
+                    batch_size=cfg.reptile.inner_loop.n_examples,
+                    use_dist=use_dist,
+                )
+                valid_dl.append(valid_dl_i)
+                valid_dataset = pdl.ParticleDataset(f"{cfg.data.path}valid_0.npz")
+            
         if valid_dataset.get_num_features() != n_features:
             raise ValueError(
                 f"`n_features` of `valid.npz` and `train.npz` should be the same"
             )
+    
+    #if cfg.mode == 'reptile':
+        #n_features -= 1
 
     return train_dl, valid_dl, n_features
 
 
-def sample_task(cfg, task_data_iters, train_dl):
+def sample_example(cfg, data_iters, dl, task):
     """Extract one example sequentially from the DataLoader."""
-    # Choose a random task number
-    task_no = torch.randint(0, cfg.reptile.n_task, (1,)).item()
 
     # Get the iterator for the chosen task
-    data_iter = task_data_iters[task_no]
+    data_iter = data_iters[task]
 
     try:
         # Extract one example sequentially from task_train_dl
         example = next(data_iter)
     except StopIteration:
         # If the DataLoader is exhausted, reinitialize the iterator
-        data_iter = iter(train_dl[task_no])
+        data_iter = iter(dl[task])
         example = next(data_iter)
 
     # Update the iterator in the dictionary
-    task_data_iters[task_no] = data_iter
+    data_iters[task] = data_iter
 
-    return example, task_data_iters
+    return example, data_iters
 
 
 def setup_tensorboard(cfg, metadata):
@@ -787,6 +803,34 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
     if use_dist:
         distribute.cleanup()
 
+def extract_specific_parameters(simulator, parameters_to_train):
+    trainable_parameters = {}
+    if "encoder" in parameters_to_train:
+        trainable_parameters['encoder'] = simulator._encode_process_decode._encoder
+    if "processor" in parameters_to_train:
+        trainable_parameters['processor'] = simulator._encode_process_decode._processor
+    if "decoder" in parameters_to_train:
+        trainable_parameters['decoder'] = simulator._encode_process_decode._decoder
+    return trainable_parameters
+
+# Function to replace trainable parameters with task-specific parameters
+def replace_with_parameters(simulator, parameters_dict, parameters_to_train):
+    if "encoder" in parameters_to_train:
+        simulator._encode_process_decode._encoder = parameters_dict["encoder"]
+    if "processor" in parameters_to_train:
+        simulator._encode_process_decode._processor = parameters_dict["processor"]
+    if "decoder" in parameters_to_train:
+        simulator._encode_process_decode._decoder = parameters_dict["decoder"]
+
+def get_parameters_list(parameters_dict, parameters_to_train):
+    parameters_list = []
+    if "encoder" in parameters_to_train:
+        parameters_list += list(parameters_dict["encoder"])
+    if "processor" in parameters_to_train:
+        parameters_list += list(parameters_dict["processor"])
+    if "decoder" in parameters_to_train:
+        parameters_list += list(parameters_dict["decoder"])
+    return parameters_list
 
 def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
     """
@@ -871,16 +915,22 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
         msg = f"Specified model_file {cfg.pretrained_model.path + cfg.pretrained_model.file} and train_state_file {cfg.pretrained_model.path + cfg.pretrained_model.train_state_file} not found."
         raise FileNotFoundError(msg)
     
-    # Extract the Encoder from the simulator and initalize Encoders for each task
-    main_encoder = simulator._encode_process_decode._encoder
-    task_encoders = defaultdict(lambda: copy.deepcopy(main_encoder))
+    # Extract specific parameters for the Reptile training
+    trainable_parameters = extract_specific_parameters(simulator, cfg.reptile.parameters)
+    
+    task_parameters_dict = defaultdict(lambda: copy.deepcopy(trainable_parameters))
     
     simulator.train()
     simulator.to(device_id)
 
     # Load datasets and initialize a dictionary for task-specific iterators
     train_dl, valid_dl, n_features = load_datasets(cfg, use_dist)
-    task_data_iters = {task_no: iter(dl) for task_no, dl in enumerate(train_dl)}
+
+    if metadata["material_feature_len"] == 0:
+        n_features -= 1
+
+    train_data_iters = {task_no: iter(dl) for task_no, dl in enumerate(train_dl)}
+    valid_data_iters = {task_no: iter(dl) for task_no, dl in enumerate(valid_dl)}
 
     print(f"rank = {rank}, cuda = {torch.cuda.is_available()}")
 
@@ -901,7 +951,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
             iter_loss = 0.0
             steps_this_meta_iter = 0
             total_steps = (
-                cfg.reptile.outer_loop.batch_size * cfg.reptile.inner_loop.iterations
+                cfg.reptile.n_task * cfg.reptile.inner_loop.iterations
             )
             with tqdm(
                 range(steps_this_meta_iter % total_steps, total_steps),
@@ -909,60 +959,56 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                 unit="step",
                 disable=not verbose,
             ) as pbar:
-                
-                material_ids = []
 
-                for _ in range(cfg.reptile.outer_loop.batch_size):
+                for task in range(cfg.reptile.n_task):
+
                     steps_per_meta_iter += 1
 
-                    # Sample a task
-                    example, task_data_iters = sample_task(cfg, task_data_iters, train_dl)
+                    task_parameters = task_parameters_dict[task]
 
-                    # Prepare data
-                    (
-                        position,
-                        particle_type,
-                        material_property,
-                        n_particles_per_example,
-                        labels,
-                    ) = prepare_data(example, device_id)
+                    # Replace the simulator's parameters with the task-specific parameters
+                    original_parameters = extract_specific_parameters(simulator, cfg.reptile.parameters)
+                    replace_with_parameters(simulator, task_parameters, cfg.reptile.parameters)
 
-                    n_particles_per_example = n_particles_per_example.to(device_id)
-                    labels = labels.to(device_id)
-
-                    sampled_noise = noise_utils.get_random_walk_noise_for_position_sequence(
-                        position, noise_std_last_step=cfg.data.noise_std
-                    ).to(device_id)
-                    non_kinematic_mask = (
-                        (particle_type != cfg.data.kinematic_particle_id)
-                        .clone()
-                        .detach()
-                        .to(device_id)
-                    )
-                    sampled_noise *= non_kinematic_mask.view(-1, 1, 1)
-
-                    device_or_rank = rank if device == torch.device("cuda") else device
-                    predict_fn = (
-                        simulator.module.predict_accelerations
-                        if use_dist
-                        else simulator.predict_accelerations
-                    )
-                    
-                    # Identify the material property and use the corresponding encoder
-                    material_id = material_property[0].item()
-                    task_encoder = task_encoders[material_id]
-                    original_encoder = simulator._encode_process_decode._encoder
-                    
-                    if material_id not in material_ids:
-                        material_ids.append(material_id)
-                    
-                    task_optimizer = optim.Adam(task_encoder.parameters(), lr=cfg.training.learning_rate.initial)
+                    task_optimizer = optim.Adam(
+                        get_parameters_list(task_parameters, cfg.reptile.parameters), 
+                        lr=cfg.training.learning_rate.initial)
 
                     # Perform a few steps of gradient descent in the inner loop
                     for _ in range(cfg.reptile.inner_loop.iterations):
-                        # Replace the simulator's encoder with the task-specific encoder
-                        # original_encoder = simulator._encode_process_decode._encoder
-                        simulator._encode_process_decode._encoder = task_encoder
+
+                        # Sample a training example
+                        example, train_data_iters = sample_example(cfg, train_data_iters, train_dl, task)
+
+                        # Prepare data
+                        (
+                            position,
+                            particle_type,
+                            material_property,
+                            n_particles_per_example,
+                            labels,
+                        ) = prepare_data(example, device_id)
+
+                        n_particles_per_example = n_particles_per_example.to(device_id)
+                        labels = labels.to(device_id)
+
+                        sampled_noise = noise_utils.get_random_walk_noise_for_position_sequence(
+                            position, noise_std_last_step=cfg.data.noise_std
+                        ).to(device_id)
+                        non_kinematic_mask = (
+                            (particle_type != cfg.data.kinematic_particle_id)
+                            .clone()
+                            .detach()
+                            .to(device_id)
+                        )
+                        sampled_noise *= non_kinematic_mask.view(-1, 1, 1)
+
+                        device_or_rank = rank if device == torch.device("cuda") else device
+                        predict_fn = (
+                            simulator.module.predict_accelerations
+                            if use_dist
+                            else simulator.predict_accelerations
+                        )
 
                         pred_acc, target_acc = predict_fn(
                             next_positions=labels.to(device_or_rank),
@@ -972,25 +1018,12 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                                 device_or_rank
                             ),
                             particle_types=particle_type.to(device_or_rank),
-                            material_property=None,
+                            material_property=(
+                            material_property.to(device_or_rank)
+                            if n_features == 3
+                            else None
+                            ),
                         )
-                        if (
-                            cfg.training.validation_interval is not None
-                            and step > 0
-                            and step % cfg.training.validation_interval == 0
-                        ):
-                            if verbose:
-                                sampled_valid_example = next(iter(valid_dl))
-                                valid_loss = validation(
-                                    simulator,
-                                    sampled_valid_example,
-                                    n_features,
-                                    cfg,
-                                    rank,
-                                    device_id,
-                                    use_dist
-                                )
-                                writer.add_scalar("Loss/valid", valid_loss.item(), step)
 
                         loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
 
@@ -1018,6 +1051,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                         if verbose:
                             writer.add_scalar("Loss/train", train_loss, step)
                             writer.add_scalar("Learning Rate", lr_new, step)
+                            writer.add_scalar(f"Loss/task_{task}", train_loss, step)
 
                         avg_loss = iter_loss / steps_this_meta_iter
                         pbar.set_postfix(
@@ -1045,34 +1079,68 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
 
                         step += 1
 
-                    # Restore the original encoder
-                    simulator._encode_process_decode._encoder = original_encoder
+                    # Restore the original parameters
+                    replace_with_parameters(simulator, original_parameters, cfg.reptile.parameters)
 
-            # After the inner loop, find the average of the task encoders
-            task_encoders_list = [task_encoders[material_id] for material_id in material_ids]
-            num_encoders = len(task_encoders_list)
-            
-            accumulated_params = {name: torch.zeros_like(param) for name, param in task_encoders_list[0].named_parameters()}
-            
-            for task_encoder in task_encoders_list:
-                for name, param in task_encoder.named_parameters():
+            if (
+                cfg.training.validation_interval is not None
+                and meta_iteration > 0
+                and meta_iteration % cfg.training.validation_interval == 0
+            ):
+                if verbose:
+                    for task in range(cfg.reptile.n_task):
+                        # Replace the simulator's parameters with the task-specific parameters
+                        original_parameters = extract_specific_parameters(simulator, cfg.reptile.parameters)
+                        replace_with_parameters(simulator, task_parameters_dict[task], cfg.reptile.parameters)
+
+                        sampled_valid_example, valid_data_iters = sample_example(cfg, valid_data_iters, valid_dl, task)
+                        valid_loss = validation(
+                            simulator,
+                            sampled_valid_example,
+                            n_features,
+                            cfg,
+                            rank,
+                            device_id,
+                            use_dist
+                        )
+                        # Restore the original parameters
+                        replace_with_parameters(simulator, original_parameters, cfg.reptile.parameters)
+                        writer.add_scalar(f"Loss/valid_{task}", valid_loss.item(), meta_iteration)
+
+
+            # After the inner loop, find the average of the task-specific simulator
+            task_parameters_list = [task_parameters[task] for task in range(cfg.reptile.n_task)]
+
+            # Initialize accumulated parameters for each component
+            accumulated_params = {
+                name: torch.zeros_like(param) 
+                for name, param in task_parameters_list[0].named_parameters()
+            }
+
+            # Accumulate parameters across tasks for each component
+            for each_task_parameter in task_parameters_list:
+                for name, param in each_task_parameter.named_parameters():
                     accumulated_params[name] += param
+
+            # Compute averaged parameters
+            averaged_params = {name: param / cfg.reptile.n_task for name, param in accumulated_params.items()}
+
+            # Save references to the original components (encoder, processor, etc.)
+            original_parameters = extract_specific_parameters(simulator, cfg.reptile.parameters)
+
+            # Compute the difference and update the original simulator components
+            for name, component in original_parameters.items():
+                for param_name, param_value in component.items():
+                    difference = param_value - averaged_params[param_name]
+                    param_value.data.copy_(param_value - cfg.reptile.outer_loop.step_size * difference)
+
+
+            # Restore the updated simulator components
+            replace_with_parameters(simulator, original_parameters, cfg.reptile.paramters)
             
-            averaged_params = {name: param / num_encoders for name, param in accumulated_params.items()}
-            
-            original_encoder = simulator._encode_process_decode._encoder
-
-            # Compute the difference and update the original parameters
-            for name, param in original_encoder.named_parameters():
-                difference = param - averaged_params[name]
-                param.data.copy_(param - cfg.reptile.outer_loop.step_size * difference)
-
-            # Restore the updated encoder
-            simulator._encode_process_decode._encoder = original_encoder
-
-            # Update task_encoders with the original_encoder
-            for key in task_encoders.keys():
-                task_encoders[key] = copy.deepcopy(original_encoder)
+            # Restore the original task parameters after training
+            for task in range(cfg.reptile.n_task):
+                task_parameters[task] = extract_specific_parameters(simulator, cfg.reptile.parameters)
 
             # meta iteration level statistics
             avg_loss = torch.tensor([iter_loss / steps_this_meta_iter]).to(device_id)
@@ -1083,22 +1151,27 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
             train_loss_hist.append((meta_iteration, avg_loss.item()))
 
             if cfg.training.validation_interval is not None:
-                sampled_valid_example = next(iter(valid_dl))
-                iter_valid_loss = validation(
-                    simulator, sampled_valid_example, n_features, cfg, rank, device_id, use_dist
-                )
-                if device == torch.device("cuda"):
-                    torch.distributed.reduce(
-                        iter_valid_loss, dst=0, op=torch.distributed.ReduceOp.SUM
+                total_valid_loss = torch.tensor([], device=device_id) 
+                for task in range(cfg.reptile.n_task):
+                    sampled_valid_example, valid_data_iters = sample_example(cfg, valid_data_iters, valid_dl, task)
+                    task_valid_loss = validation(
+                        simulator,
+                        sampled_valid_example,
+                        n_features,
+                        cfg,
+                        rank,
+                        device_id,
+                        use_dist
                     )
-                    iter_valid_loss /= world_size
-                valid_loss_hist.append((meta_iteration, iter_valid_loss.item()))
+                    total_valid_loss = torch.cat((total_valid_loss, task_valid_loss.unsqueeze(0)))
+                    
+                avg_valid_loss = total_valid_loss.mean().item()
 
             if verbose:
                 writer.add_scalar("Loss/train_iter", avg_loss.item(), meta_iteration)
                 if cfg.training.validation_interval is not None:
                     writer.add_scalar(
-                        "Loss/valid_train_iter", iter_valid_loss.item(), meta_iteration
+                        "Loss/valid_iter", avg_valid_loss, meta_iteration
                     )
 
     except KeyboardInterrupt:

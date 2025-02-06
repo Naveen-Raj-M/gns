@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 from omegaconf import MISSING
 from hydra.core.config_store import ConfigStore
 
@@ -83,6 +83,7 @@ class OuterLoopConfig:
 @dataclass
 class ReptileConfig:
     n_task: int = 3
+    parameters: List[str] = field(default_factory=lambda: ["encoder", "processor", "decoder"])
     inner_loop: InnerLoopConfig = field(default_factory=InnerLoopConfig)
     outer_loop: OuterLoopConfig = field(default_factory=OuterLoopConfig)
 
