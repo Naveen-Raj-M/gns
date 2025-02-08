@@ -11,9 +11,11 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn import Module
 import torch.optim as optim
 from tqdm import tqdm
 from collections import defaultdict
+from typing import Dict, List
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -803,34 +805,123 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
     if use_dist:
         distribute.cleanup()
 
-def extract_specific_parameters(simulator, parameters_to_train):
-    trainable_parameters = {}
-    if "encoder" in parameters_to_train:
-        trainable_parameters['encoder'] = simulator._encode_process_decode._encoder
-    if "processor" in parameters_to_train:
-        trainable_parameters['processor'] = simulator._encode_process_decode._processor
-    if "decoder" in parameters_to_train:
-        trainable_parameters['decoder'] = simulator._encode_process_decode._decoder
-    return trainable_parameters
 
-# Function to replace trainable parameters with task-specific parameters
-def replace_with_parameters(simulator, parameters_dict, parameters_to_train):
-    if "encoder" in parameters_to_train:
-        simulator._encode_process_decode._encoder = parameters_dict["encoder"]
-    if "processor" in parameters_to_train:
-        simulator._encode_process_decode._processor = parameters_dict["processor"]
-    if "decoder" in parameters_to_train:
-        simulator._encode_process_decode._decoder = parameters_dict["decoder"]
+def extract_specific_parameters(simulator: Module, components: List[str]) -> Dict[str, Module]:
+    """
+    Extracts specified components (encoder, processor, decoder) from the simulator.
 
-def get_parameters_list(parameters_dict, parameters_to_train):
+    Args:
+        simulator (Module): The simulator containing the components.
+        components (List[str]): List of component names to extract ('encoder', 'processor', 'decoder').
+
+    Returns:
+        Dict[str, Module]: A dictionary containing the extracted components.
+    """
+    extracted_components = {}
+    if "encoder" in components:
+        extracted_components['encoder'] = simulator._encode_process_decode._encoder
+    if "processor" in components:
+        extracted_components['processor'] = simulator._encode_process_decode._processor
+    if "decoder" in components:
+        extracted_components['decoder'] = simulator._encode_process_decode._decoder
+    return extracted_components
+
+
+def replace_with_parameters(simulator: Module, model_dict: Dict[str, Module], components: List[str]) -> Module:
+    """
+    Replaces the specified components in the simulator with the ones provided in model_dict.
+
+    Args:
+        simulator (Module): The simulator to update.
+        model_dict (Dict[str, Module]): Dictionary containing the new components.
+        components (List[str]): List of components to replace ('encoder', 'processor', 'decoder').
+
+    Returns:
+        Module: The updated simulator.
+    """
+    if "encoder" in components:
+        simulator._encode_process_decode._encoder = model_dict["encoder"]
+    if "processor" in components:
+        simulator._encode_process_decode._processor = model_dict["processor"]
+    if "decoder" in components:
+        simulator._encode_process_decode._decoder = model_dict["decoder"]
+    return simulator
+
+
+def get_parameters_list(model_dict: Dict[str, Module], components: List[str]) -> List[torch.Tensor]:
+    """
+    Collects the parameters of the specified components from model_dict.
+
+    Args:
+        model_dict (Dict[str, Module]): Dictionary containing model components.
+        components (List[str]): List of components to extract parameters from ('encoder', 'processor', 'decoder').
+
+    Returns:
+        List[torch.Tensor]: List of parameters from the specified components.
+    """
     parameters_list = []
-    if "encoder" in parameters_to_train:
-        parameters_list += list(parameters_dict["encoder"])
-    if "processor" in parameters_to_train:
-        parameters_list += list(parameters_dict["processor"])
-    if "decoder" in parameters_to_train:
-        parameters_list += list(parameters_dict["decoder"])
+    if "encoder" in components:
+        parameters_list += list(model_dict["encoder"].parameters())
+    if "processor" in components:
+        parameters_list += list(model_dict["processor"].parameters())
+    if "decoder" in components:
+        parameters_list += list(model_dict["decoder"].parameters())
     return parameters_list
+
+
+def meta_update(
+    simulator: Module, 
+    task_parameters_dict: Dict[int, Dict[str, Module]], 
+    component: str, 
+    cfg: Module
+) -> (Module, Dict[int, Dict[str, Module]]):
+    """
+    Performs a meta-update by averaging task-specific parameters for a given component.
+
+    Args:
+        simulator (Module): The main simulator model.
+        task_parameters_dict (Dict[int, Dict[str, Module]]): Dictionary containing task-specific parameters.
+        component (str): The component to update ('encoder', 'processor', or 'decoder').
+        cfg (Module): Configuration object containing hyperparameters.
+
+    Returns:
+        Tuple[Module, Dict[int, Dict[str, Module]]]:
+            Updated simulator and task parameters dictionary.
+    """
+    # Find the average of the task-specific simulator parameters
+    task_parameters_list = [task_parameters_dict[task][component] for task in range(cfg.reptile.n_task)]
+
+    # Initialize accumulated parameters for each component
+    accumulated_params = {
+        name: torch.zeros_like(param)
+        for name, param in task_parameters_list[0].named_parameters()
+    }
+
+    # Accumulate parameters across tasks for each component
+    for each_task_parameter in task_parameters_list:
+        for name, param in each_task_parameter.named_parameters():
+            accumulated_params[name] += param
+
+    # Compute averaged parameters
+    averaged_params = {name: param / cfg.reptile.n_task for name, param in accumulated_params.items()}
+
+    # Save references to the original components (encoder, processor, etc.)
+    original_parameters = extract_specific_parameters(simulator, [component])
+
+    # Compute the difference and update the original simulator components
+    for name, param in original_parameters[component].named_parameters():
+        difference = param - averaged_params[name]
+        param.data.copy_(param - cfg.reptile.outer_loop.step_size * difference)
+
+    # Restore the updated simulator components
+    simulator = replace_with_parameters(simulator, original_parameters, [component])
+
+    # Restore the original task parameters after training
+    for task in range(cfg.reptile.n_task):
+        task_parameters_dict[task][component] = extract_specific_parameters(simulator, [component])[component]
+
+    return simulator, task_parameters_dict
+
 
 def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
     """
@@ -968,7 +1059,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
 
                     # Replace the simulator's parameters with the task-specific parameters
                     original_parameters = extract_specific_parameters(simulator, cfg.reptile.parameters)
-                    replace_with_parameters(simulator, task_parameters, cfg.reptile.parameters)
+                    simulator = replace_with_parameters(simulator, task_parameters, cfg.reptile.parameters)
 
                     task_optimizer = optim.Adam(
                         get_parameters_list(task_parameters, cfg.reptile.parameters), 
@@ -1080,7 +1171,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                         step += 1
 
                     # Restore the original parameters
-                    replace_with_parameters(simulator, original_parameters, cfg.reptile.parameters)
+                    simulator = replace_with_parameters(simulator, original_parameters, cfg.reptile.parameters)
 
             if (
                 cfg.training.validation_interval is not None
@@ -1091,7 +1182,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                     for task in range(cfg.reptile.n_task):
                         # Replace the simulator's parameters with the task-specific parameters
                         original_parameters = extract_specific_parameters(simulator, cfg.reptile.parameters)
-                        replace_with_parameters(simulator, task_parameters_dict[task], cfg.reptile.parameters)
+                        simulator = replace_with_parameters(simulator, task_parameters_dict[task], cfg.reptile.parameters)
 
                         sampled_valid_example, valid_data_iters = sample_example(cfg, valid_data_iters, valid_dl, task)
                         valid_loss = validation(
@@ -1104,44 +1195,14 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                             use_dist
                         )
                         # Restore the original parameters
-                        replace_with_parameters(simulator, original_parameters, cfg.reptile.parameters)
+                        simulator = replace_with_parameters(simulator, original_parameters, cfg.reptile.parameters)
                         writer.add_scalar(f"Loss/valid_{task}", valid_loss.item(), meta_iteration)
 
-
-            # After the inner loop, find the average of the task-specific simulator
-            task_parameters_list = [task_parameters[task] for task in range(cfg.reptile.n_task)]
-
-            # Initialize accumulated parameters for each component
-            accumulated_params = {
-                name: torch.zeros_like(param) 
-                for name, param in task_parameters_list[0].named_parameters()
-            }
-
-            # Accumulate parameters across tasks for each component
-            for each_task_parameter in task_parameters_list:
-                for name, param in each_task_parameter.named_parameters():
-                    accumulated_params[name] += param
-
-            # Compute averaged parameters
-            averaged_params = {name: param / cfg.reptile.n_task for name, param in accumulated_params.items()}
-
-            # Save references to the original components (encoder, processor, etc.)
-            original_parameters = extract_specific_parameters(simulator, cfg.reptile.parameters)
-
-            # Compute the difference and update the original simulator components
-            for name, component in original_parameters.items():
-                for param_name, param_value in component.items():
-                    difference = param_value - averaged_params[param_name]
-                    param_value.data.copy_(param_value - cfg.reptile.outer_loop.step_size * difference)
-
-
-            # Restore the updated simulator components
-            replace_with_parameters(simulator, original_parameters, cfg.reptile.paramters)
-            
-            # Restore the original task parameters after training
-            for task in range(cfg.reptile.n_task):
-                task_parameters[task] = extract_specific_parameters(simulator, cfg.reptile.parameters)
-
+            for component in cfg.reptile.parameters:
+                simulator, task_parameters_dict = meta_update(simulator,
+                                                              task_parameters_dict,
+                                                              component,
+                                                              cfg)
             # meta iteration level statistics
             avg_loss = torch.tensor([iter_loss / steps_this_meta_iter]).to(device_id)
             if use_dist:
