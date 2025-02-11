@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 from gns import graph_network
 from torch_geometric.nn import radius_graph
-from typing import Dict
+from typing import Dict, List
 
 
 class LearnedSimulator(nn.Module):
@@ -223,7 +223,7 @@ class LearnedSimulator(nn.Module):
         )
 
     def _decoder_postprocessor(
-        self, normalized_acceleration: torch.tensor, position_sequence: torch.tensor
+        self, normalized_acceleration: torch.tensor, position_sequence: torch.tensor, gravity
     ) -> torch.tensor:
         """Compute new position based on acceleration and current position.
         The model produces the output in normalized space so we apply inverse
@@ -241,7 +241,7 @@ class LearnedSimulator(nn.Module):
         acceleration_stats = self._normalization_stats["acceleration"]
         acceleration = (
             normalized_acceleration * acceleration_stats["std"]
-        ) + acceleration_stats["mean"]
+        ) + acceleration_stats["mean"] - torch.tensor(gravity).to(self._device)
 
         # Use an Euler integrator to go from acceleration to position, assuming
         # a dt=1 corresponding to the size of the finite difference.
@@ -259,6 +259,7 @@ class LearnedSimulator(nn.Module):
         nparticles_per_example: torch.tensor,
         particle_types: torch.tensor,
         material_property: torch.tensor = None,
+        gravity: List[float] = None
     ) -> torch.tensor:
         """Predict position based on acceleration.
 
@@ -286,8 +287,10 @@ class LearnedSimulator(nn.Module):
         predicted_normalized_acceleration = self._encode_process_decode(
             node_features, edge_index, edge_features
         )
+        if gravity is not None:
+            predicted_normalized_acceleration += torch.tensor(gravity).to(self._device)
         next_positions = self._decoder_postprocessor(
-            predicted_normalized_acceleration, current_positions
+            predicted_normalized_acceleration, current_positions, gravity
         )
         return next_positions
 
@@ -299,6 +302,7 @@ class LearnedSimulator(nn.Module):
         nparticles_per_example: torch.tensor,
         particle_types: torch.tensor,
         material_property: torch.tensor = None,
+        gravity: List[float] = None
     ):
         """Produces normalized and predicted acceleration targets.
 
@@ -343,7 +347,7 @@ class LearnedSimulator(nn.Module):
         # is shifted by the noise in the last input position.
         next_position_adjusted = next_positions + position_sequence_noise[:, -1]
         target_normalized_acceleration = self._inverse_decoder_postprocessor(
-            next_position_adjusted, noisy_position_sequence
+            next_position_adjusted, noisy_position_sequence, gravity
         )
         # As a result the inverted Euler update in the `_inverse_decoder` produces:
         # * A target acceleration that does not explicitly correct for the noise in
@@ -354,10 +358,13 @@ class LearnedSimulator(nn.Module):
         #   as `next_position_adjusted - noisy_position_sequence[:,-1]`
         #   matches the ground truth next velocity (noise cancels out).
 
+        if gravity is not None:
+            predicted_normalized_acceleration += torch.tensor(gravity).to(self._device)
+
         return predicted_normalized_acceleration, target_normalized_acceleration
 
     def _inverse_decoder_postprocessor(
-        self, next_position: torch.tensor, position_sequence: torch.tensor
+        self, next_position: torch.tensor, position_sequence: torch.tensor, gravity: List[float] = None
     ):
         """Inverse of `_decoder_postprocessor`.
 
@@ -378,7 +385,7 @@ class LearnedSimulator(nn.Module):
 
         acceleration_stats = self._normalization_stats["acceleration"]
         normalized_acceleration = (
-            acceleration - acceleration_stats["mean"]
+            acceleration - acceleration_stats["mean"] + torch.tensor(gravity).to(self._device)
         ) / acceleration_stats["std"]
         return normalized_acceleration
 

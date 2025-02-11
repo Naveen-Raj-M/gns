@@ -68,6 +68,7 @@ def rollout(
             nparticles_per_example=[n_particles_per_example],
             particle_types=particle_types,
             material_property=material_property,
+            gravity=cfg.training.gravity,
         )
 
         # Update kinematic particles from prescribed trajectory.
@@ -667,7 +668,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                         position_sequence_noise=sampled_noise.to(device_or_rank),
                         position_sequence=position.to(device_or_rank),
                         nparticles_per_example=n_particles_per_example.to(
-                            device_or_rank
+                            device_or_rank,
                         ),
                         particle_types=particle_type.to(device_or_rank),
                         material_property=(
@@ -675,6 +676,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                             if n_features == 3
                             else None
                         ),
+                        gravity=cfg.training.gravity
                     )
 
                     if (
@@ -1114,6 +1116,7 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                             if n_features == 3
                             else None
                             ),
+                            gravity=cfg.training.gravity
                         )
 
                         loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
@@ -1363,6 +1366,7 @@ def validation(simulator, example, n_features, cfg, rank, device_id, use_dist):
             material_property=(
                 material_property.to(device_or_rank) if n_features == 3 else None
             ),
+            gravity=cfg.training.gravity
         )
 
     # Compute loss

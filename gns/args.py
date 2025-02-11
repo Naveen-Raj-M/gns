@@ -41,6 +41,7 @@ class TrainingConfig:
     save_steps: int = 500
     resume: Optional[bool] = False
     learning_rate: LearningRateConfig = field(default_factory=LearningRateConfig)
+    gravity: Optional[list[float]] = None
 
 
 @dataclass

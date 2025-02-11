@@ -9,12 +9,12 @@ hydra:
     dir: .
 
 # Top-level configuration
-mode: reptile
+mode: train
 
 # Data configuration
 data:
-  path: ../ColumnCollapseFrictional/reptile_datasets/
-  batch_size: 3
+  path: ../../terramechanics/datasets/
+  batch_size: 2
   noise_std: 6.7e-4
   input_sequence_length: 6
   num_particle_types: 9
@@ -22,25 +22,26 @@ data:
 
 # Model configuration
 model:
-  path: ../ColumnCollapseFrictional/reptile_models/
+  path: ../../terramechanics/models_2/
   file: null
   train_state_file: null
 
 # Output configuration
 output:
-  path: ../ColumnCollapseFrictional/reptile_rollouts/
+  path: ../../terramechanics/rollouts/
   filename: rollout
 
 # Training configuration
 training:
-  steps: 100
+  steps: 3000000
   validation_interval: null
-  save_steps: 500
+  save_steps: 1000
   resume: False
+  gravity: [0, -0.0000613125]
   learning_rate:
     initial: 1e-4
     decay: 0.1
-    decay_steps: 50000
+    decay_steps: 5000000
 
 # Hardware configuration
 hardware:
@@ -48,7 +49,7 @@ hardware:
 
 # Logging configuration
 logging:
-  tensorboard_dir: logs/
+  tensorboard_dir: ../logs/terramechanics/models_2
 
 # Rendering configuration
 rendering:
@@ -59,21 +60,3 @@ rendering:
     vertical_camera_angle: 20
     viewpoint_rotation: 0.3
     change_yz: False
-
-# Reptile Configuration
-reptile:
-  n_task: 3
-  inner_loop:
-    n_examples: 3
-    iterations: 5
-  
-  outer_loop:
-    batch_size: 5
-    step_size: 1
-    iterations: 10000
-
-# Pretrained-Model configuration
-pretrained_model:
-  path: ../ColumnCollapseSimple/models/
-  file: model.pt
-  train_state_file: train_state.pt
