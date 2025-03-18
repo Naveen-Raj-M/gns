@@ -127,6 +127,7 @@ def predict(device: str, cfg: DictConfig):
         cfg.data.num_particle_types,
         cfg.data.noise_std,
         cfg.data.noise_std,
+        cfg.training.nmessage_passing_steps,
         device,
     )
 
@@ -350,6 +351,7 @@ def setup_simulator_and_optimizer(cfg, metadata, rank, world_size, device, use_d
             cfg.data.num_particle_types,
             cfg.data.noise_std,
             cfg.data.noise_std,
+            cfg.training.nmessage_passing_steps,
             rank,
         )
         if use_dist:
@@ -365,6 +367,7 @@ def setup_simulator_and_optimizer(cfg, metadata, rank, world_size, device, use_d
             cfg.data.num_particle_types,
             cfg.data.noise_std,
             cfg.data.noise_std,
+            cfg.training.nmessage_passing_steps,
             device,
         )
         optimizer = torch.optim.Adam(
@@ -1308,6 +1311,7 @@ def _get_simulator(
     num_particle_types: int,
     acc_noise_std: float,
     vel_noise_std: float,
+    nmessage_passing_steps: int,
     device: torch.device,
 ) -> learned_simulator.LearnedSimulator:
     """Instantiates the simulator.
@@ -1351,7 +1355,7 @@ def _get_simulator(
         nnode_in=nnode_in,
         nedge_in=nedge_in,
         latent_dim=128,
-        nmessage_passing_steps=10,
+        nmessage_passing_steps=nmessage_passing_steps,
         nmlp_layers=2,
         mlp_hidden_dim=128,
         connectivity_radius=metadata["default_connectivity_radius"],
