@@ -239,9 +239,16 @@ class LearnedSimulator(nn.Module):
         """
         # Extract real acceleration values from normalized values
         acceleration_stats = self._normalization_stats["acceleration"]
-        acceleration = (
-            normalized_acceleration * acceleration_stats["std"]
-        ) + acceleration_stats["mean"] - torch.tensor(gravity).to(self._device)
+
+        if gravity is not None:
+          acceleration = (
+              normalized_acceleration * acceleration_stats["std"]
+          ) + acceleration_stats["mean"] - torch.tensor(gravity).to(self._device)
+        
+        else:
+            acceleration = (
+              normalized_acceleration * acceleration_stats["std"]
+          ) + acceleration_stats["mean"]
 
         # Use an Euler integrator to go from acceleration to position, assuming
         # a dt=1 corresponding to the size of the finite difference.
@@ -384,9 +391,17 @@ class LearnedSimulator(nn.Module):
         acceleration = next_velocity - previous_velocity
 
         acceleration_stats = self._normalization_stats["acceleration"]
-        normalized_acceleration = (
-            acceleration - acceleration_stats["mean"] + torch.tensor(gravity).to(self._device)
-        ) / acceleration_stats["std"]
+
+        if gravity is not None:
+          normalized_acceleration = (
+              acceleration - acceleration_stats["mean"] + torch.tensor(gravity).to(self._device)
+          ) / acceleration_stats["std"]
+        
+        else:
+            normalized_acceleration = (
+              acceleration - acceleration_stats["mean"]
+          ) / acceleration_stats["std"]
+        
         return normalized_acceleration
 
     def save(self, path: str = "model.pt"):
