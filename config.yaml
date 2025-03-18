@@ -13,8 +13,8 @@ mode: train
 
 # Data configuration
 data:
-  path: ../../terramechanics/datasets/
-  batch_size: 2
+  path: /scratch/10114/naveen_raj_manoharan/terramechanics/datasets/training/
+  batch_size: 8
   noise_std: 6.7e-4
   input_sequence_length: 6
   num_particle_types: 9
@@ -22,13 +22,13 @@ data:
 
 # Model configuration
 model:
-  path: ../../terramechanics/models_2/
+  path: /scratch/10114/naveen_raj_manoharan/terramechanics/models/models_gravity_1/
   file: null
   train_state_file: null
 
 # Output configuration
 output:
-  path: ../../terramechanics/rollouts/
+  path: ../terramechanics/rollouts/
   filename: rollout
 
 # Training configuration
@@ -37,11 +37,13 @@ training:
   validation_interval: null
   save_steps: 1000
   resume: False
-  gravity: [0, -0.0000613125]
+  gravity: null
+  parameters: ["encoder", "processor", "decoder"]
   learning_rate:
     initial: 1e-4
     decay: 0.1
     decay_steps: 5000000
+  nmessage_passing_steps: 10
 
 # Hardware configuration
 hardware:
@@ -49,7 +51,7 @@ hardware:
 
 # Logging configuration
 logging:
-  tensorboard_dir: ../logs/terramechanics/models_2
+  tensorboard_dir: /scratch/10114/naveen_raj_manoharan/terramechanics/logs/models_gravity_1
 
 # Rendering configuration
 rendering:
@@ -60,3 +62,21 @@ rendering:
     vertical_camera_angle: 20
     viewpoint_rotation: 0.3
     change_yz: False
+
+# Reptile Configuration
+reptile:
+  n_task: 2
+  parameters: ["encoder", "processor", "decoder"]
+  inner_loop:
+    n_examples: 2
+    iterations: 1000
+  
+  outer_loop:
+    step_size: 1e-1
+    iterations: 50000
+
+# Pretrained-Model configuration
+pretrained_model:
+  path: ../pretrained_model_1/models/
+  file: model-500000.pt
+  train_state_file: train_state-500000.pt
