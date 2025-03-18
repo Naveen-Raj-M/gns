@@ -401,8 +401,11 @@ def load_datasets(cfg, use_dist):
             use_dist=use_dist,
         )
         train_dataset = pdl.ParticleDataset(f"{cfg.data.path}train.npz")
+
     elif cfg.mode == 'reptile':
         train_dl = []
+
+        # Load dataset for each friction angle
         for i in range(cfg.reptile.n_task):
             train_dl_i = pdl.get_data_loader(
                 file_path=f"{cfg.data.path}train_{i}.npz",
@@ -445,10 +448,7 @@ def load_datasets(cfg, use_dist):
         if valid_dataset.get_num_features() != n_features:
             raise ValueError(
                 f"`n_features` of `valid.npz` and `train.npz` should be the same"
-            )
-    
-    #if cfg.mode == 'reptile':
-        #n_features -= 1
+            ) 
 
     return train_dl, valid_dl, n_features
 
@@ -462,6 +462,7 @@ def sample_example(cfg, data_iters, dl, task):
     try:
         # Extract one example sequentially from task_train_dl
         example = next(data_iter)
+    
     except StopIteration:
         # If the DataLoader is exhausted, reinitialize the iterator
         data_iter = iter(dl[task])
@@ -585,13 +586,25 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
 
             # set global train state
             step = train_state["global_train_state"]["step"]
-            epoch = train_state["global_train_state"]["epoch"]
-            train_loss_hist = train_state["loss_history"]["train"]
-            valid_loss_hist = train_state["loss_history"]["valid"]
+            if "epoch" in train_state["global_train_state"] and train_state["global_train_state"]["epoch"]:
+                epoch = train_state["global_train_state"]["epoch"]
+
+            if "train" in train_state["loss_history"] and train_state["loss_history"]["train"]:
+                train_loss_hist = train_state["loss_history"]["train"]
+
+            if "valid" in train_state["loss_history"] and train_state["loss_history"]["valid"]:
+                valid_loss_hist = train_state["loss_history"]["valid"]
 
         else:
             msg = f"Specified model_file {cfg.model.path + cfg.model.file} and train_state_file {cfg.model.path + cfg.model.train_state_file} not found."
             raise FileNotFoundError(msg)
+    
+    # Extract specific parameters for the training
+    trainable_parameters = extract_specific_parameters(simulator, cfg.training.parameters)
+
+    optimizer = optim.Adam(
+                        get_parameters_list(trainable_parameters, cfg.training.parameters), 
+                        lr=cfg.training.learning_rate.initial)
 
     simulator.train()
     simulator.to(device_id)
@@ -826,6 +839,18 @@ def extract_specific_parameters(simulator: Module, components: List[str]) -> Dic
         extracted_components['processor'] = simulator._encode_process_decode._processor
     if "decoder" in components:
         extracted_components['decoder'] = simulator._encode_process_decode._decoder
+    
+    model_structure = simulator._encode_process_decode
+
+    # Extract specific GNN stack layers like 'stacks0', 'stacks1', etc.
+    for comp in components:
+        if comp.startswith("stacks"):
+            try:
+                stack_idx = int(comp.replace("stacks", ""))  # Extract stack index
+                extracted_components[comp] = model_structure._processor.gnn_stacks[stack_idx]
+            except (ValueError, IndexError, AttributeError):
+                print(f"Warning: Invalid component reference '{comp}'.")
+
     return extracted_components
 
 
@@ -847,6 +872,13 @@ def replace_with_parameters(simulator: Module, model_dict: Dict[str, Module], co
         simulator._encode_process_decode._processor = model_dict["processor"]
     if "decoder" in components:
         simulator._encode_process_decode._decoder = model_dict["decoder"]
+
+     # Handle specific stack layers dynamically
+    for component in components:
+        if component.startswith("stacks"):
+            stack_idx = int(component.replace("stacks", ""))
+            simulator._encode_process_decode._processor.gnn_stacks[stack_idx] = model_dict[component]
+
     return simulator
 
 
@@ -868,6 +900,13 @@ def get_parameters_list(model_dict: Dict[str, Module], components: List[str]) ->
         parameters_list += list(model_dict["processor"].parameters())
     if "decoder" in components:
         parameters_list += list(model_dict["decoder"].parameters())
+    
+    # Handle specific stack layers dynamically
+    for component in components:
+        if component.startswith("stacks"):
+            if component in model_dict:
+                parameters_list += list(model_dict[component].parameters())
+
     return parameters_list
 
 
