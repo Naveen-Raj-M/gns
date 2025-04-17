@@ -15,7 +15,7 @@ from torch.nn import Module
 import torch.optim as optim
 from tqdm import tqdm
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Union
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -68,7 +68,6 @@ def rollout(
             nparticles_per_example=[n_particles_per_example],
             particle_types=particle_types,
             material_property=material_property,
-            gravity=cfg.training.gravity,
         )
 
         # Update kinematic particles from prescribed trajectory.
@@ -404,11 +403,8 @@ def load_datasets(cfg, use_dist):
             use_dist=use_dist,
         )
         train_dataset = pdl.ParticleDataset(f"{cfg.data.path}train.npz")
-
     elif cfg.mode == 'reptile':
         train_dl = []
-
-        # Load dataset for each friction angle
         for i in range(cfg.reptile.n_task):
             train_dl_i = pdl.get_data_loader(
                 file_path=f"{cfg.data.path}train_{i}.npz",
@@ -451,7 +447,7 @@ def load_datasets(cfg, use_dist):
         if valid_dataset.get_num_features() != n_features:
             raise ValueError(
                 f"`n_features` of `valid.npz` and `train.npz` should be the same"
-            ) 
+            )
 
     return train_dl, valid_dl, n_features
 
@@ -465,7 +461,6 @@ def sample_example(cfg, data_iters, dl, task):
     try:
         # Extract one example sequentially from task_train_dl
         example = next(data_iter)
-    
     except StopIteration:
         # If the DataLoader is exhausted, reinitialize the iterator
         data_iter = iter(dl[task])
@@ -587,16 +582,16 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
             optimizer.load_state_dict(train_state["optimizer_state"])
             optimizer_to(optimizer, device_id)
 
-            # set global train state
-            step = train_state["global_train_state"]["step"]
-            if "epoch" in train_state["global_train_state"] and train_state["global_train_state"]["epoch"]:
-                epoch = train_state["global_train_state"]["epoch"]
+            if "global_train_state" in train_state:
+                step = train_state["global_train_state"]["step"]
+                if "epoch" in train_state["global_train_state"]:
+                    epoch = train_state["global_train_state"]["epoch"]
 
-            if "train" in train_state["loss_history"] and train_state["loss_history"]["train"]:
-                train_loss_hist = train_state["loss_history"]["train"]
-
-            if "valid" in train_state["loss_history"] and train_state["loss_history"]["valid"]:
-                valid_loss_hist = train_state["loss_history"]["valid"]
+            if "loss_history" in train_state:
+                if "train" in train_state["loss_history"]:
+                    train_loss_hist = train_state["loss_history"]["train"]
+                if "valid" in train_state["loss_history"]:
+                    valid_loss_hist = train_state["loss_history"]["valid"]
 
         else:
             msg = f"Specified model_file {cfg.model.path + cfg.model.file} and train_state_file {cfg.model.path + cfg.model.train_state_file} not found."
@@ -692,7 +687,6 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                             if n_features == 3
                             else None
                         ),
-                        gravity=cfg.training.gravity
                     )
 
                     if (
@@ -795,6 +789,22 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                     writer.add_scalar(
                         "Loss/valid_epoch", epoch_valid_loss.item(), epoch
                     )
+            
+            # Save model after each epoch
+            save_model_and_train_state(
+                            verbose,
+                            device,
+                            simulator,
+                            cfg,
+                            step,
+                            epoch,
+                            optimizer,
+                            train_loss,
+                            valid_loss,
+                            train_loss_hist,
+                            valid_loss_hist,
+                            use_dist,
+                        )
 
             if step >= cfg.training.steps:
                 break
@@ -827,10 +837,11 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
 def extract_specific_parameters(simulator: Module, components: List[str]) -> Dict[str, Module]:
     """
     Extracts specified components (encoder, processor, decoder) from the simulator.
+    If "layer1" is in components, it extracts only NN-0 weight and bias for edge and node embeddings in stacks0.
 
     Args:
         simulator (Module): The simulator containing the components.
-        components (List[str]): List of component names to extract ('encoder', 'processor', 'decoder').
+        components (List[str]): List of component names to extract ('encoder', 'processor', 'decoder', 'layer1').
 
     Returns:
         Dict[str, Module]: A dictionary containing the extracted components.
@@ -844,7 +855,7 @@ def extract_specific_parameters(simulator: Module, components: List[str]) -> Dic
         extracted_components['decoder'] = simulator._encode_process_decode._decoder
     
     model_structure = simulator._encode_process_decode
-
+    
     # Extract specific GNN stack layers like 'stacks0', 'stacks1', etc.
     for comp in components:
         if comp.startswith("stacks"):
@@ -853,18 +864,36 @@ def extract_specific_parameters(simulator: Module, components: List[str]) -> Dic
                 extracted_components[comp] = model_structure._processor.gnn_stacks[stack_idx]
             except (ValueError, IndexError, AttributeError):
                 print(f"Warning: Invalid component reference '{comp}'.")
+    
+    # Extract only NN-0 weight and bias from node_fn and edge_fn if "layer1" is requested 
+    for component in components:
+        if component.startswith("layer"):
+            try:
+                stacks0 = model_structure._processor.gnn_stacks[0]
+                # Parse the layer number from "layerN"
+                nn_idx = int(component.replace("layer", "")) + 1
 
+                extracted_components[component] = {
+                    f"node_NN-{nn_idx}.weight": stacks0.node_fn[0][nn_idx].weight,
+                    f"node_NN-{nn_idx}.bias": stacks0.node_fn[0][nn_idx].bias,
+                    f"edge_NN-{nn_idx}.weight": stacks0.edge_fn[0][nn_idx].weight,
+                    f"edge_NN-{nn_idx}.bias": stacks0.edge_fn[0][nn_idx].bias,
+                }
+            except (AttributeError, IndexError, KeyError, ValueError) as e:
+                print(f"Error extracting parameters from {component}: {e}")
+
+    
     return extracted_components
-
 
 def replace_with_parameters(simulator: Module, model_dict: Dict[str, Module], components: List[str]) -> Module:
     """
     Replaces the specified components in the simulator with the ones provided in model_dict.
+    If "layer1" is in components, it replaces only NN-0 weight and bias for edge and node embeddings in stacks0.
 
     Args:
         simulator (Module): The simulator to update.
         model_dict (Dict[str, Module]): Dictionary containing the new components.
-        components (List[str]): List of components to replace ('encoder', 'processor', 'decoder').
+        components (List[str]): List of components to replace ('encoder', 'processor', 'decoder', 'layer1').
 
     Returns:
         Module: The updated simulator.
@@ -876,22 +905,37 @@ def replace_with_parameters(simulator: Module, model_dict: Dict[str, Module], co
     if "decoder" in components:
         simulator._encode_process_decode._decoder = model_dict["decoder"]
 
-     # Handle specific stack layers dynamically
+    # Handle specific stack layers dynamically
     for component in components:
         if component.startswith("stacks"):
             stack_idx = int(component.replace("stacks", ""))
             simulator._encode_process_decode._processor.gnn_stacks[stack_idx] = model_dict[component]
 
-    return simulator
+    # Replace only NN-0 weight and bias from node_fn and edge_fn in stacks0 if "layer1" is in components
+    for component in components:
+        if component.startswith("layer"):
+            try:
+                stacks0 = simulator._encode_process_decode._processor.gnn_stacks[0]
+                nn_idx = int(component.replace("layer", "")) + 1
 
+                stacks0.node_fn[0][nn_idx].weight = model_dict[component][f"node_NN-{nn_idx}.weight"]
+                stacks0.node_fn[0][nn_idx].bias = model_dict[component][f"node_NN-{nn_idx}.bias"]
+                stacks0.edge_fn[0][nn_idx].weight = model_dict[component][f"edge_NN-{nn_idx}.weight"]
+                stacks0.edge_fn[0][nn_idx].bias = model_dict[component][f"edge_NN-{nn_idx}.bias"]
+            except (AttributeError, IndexError, KeyError):
+                print(f"Warning: Unable to replace NN-{nn_idx} parameters in {component}.")
+
+    
+    return simulator
 
 def get_parameters_list(model_dict: Dict[str, Module], components: List[str]) -> List[torch.Tensor]:
     """
     Collects the parameters of the specified components from model_dict.
+    If "layer1" is in components, it collects only NN-0 weight and bias for edge and node embeddings in stacks0.
 
     Args:
         model_dict (Dict[str, Module]): Dictionary containing model components.
-        components (List[str]): List of components to extract parameters from ('encoder', 'processor', 'decoder').
+        components (List[str]): List of components to extract parameters from ('encoder', 'processor', 'decoder', 'layer1').
 
     Returns:
         List[torch.Tensor]: List of parameters from the specified components.
@@ -909,60 +953,100 @@ def get_parameters_list(model_dict: Dict[str, Module], components: List[str]) ->
         if component.startswith("stacks"):
             if component in model_dict:
                 parameters_list += list(model_dict[component].parameters())
+    
+    # Collect only NN-0 weight and bias from node_fn and edge_fn in stacks0 if "layer1" is in components
+    for component in components:
+        if component.startswith("layer"):
+            try:
+                nn_idx = int(component.replace("layer", "")) + 1
+
+                layer_params = [
+                    model_dict[component][f"node_NN-{nn_idx}.weight"],
+                    model_dict[component][f"node_NN-{nn_idx}.bias"],
+                    model_dict[component][f"edge_NN-{nn_idx}.weight"],
+                    model_dict[component][f"edge_NN-{nn_idx}.bias"],
+                ]
+                parameters_list.extend(layer_params)
+            except KeyError:
+                print(f"Warning: Unable to collect NN-{nn_idx} parameters from {component}.")
 
     return parameters_list
 
-
 def meta_update(
     simulator: Module, 
-    task_parameters_dict: Dict[int, Dict[str, Module]], 
+    task_parameters_dict: Dict[int, Dict[str, Union[Module, Dict[str, torch.Tensor]]]], 
     component: str, 
     cfg: Module
-) -> (Module, Dict[int, Dict[str, Module]]):
+) -> (Module, Dict[int, Dict[str, Union[Module, Dict[str, torch.Tensor]]]]):
     """
     Performs a meta-update by averaging task-specific parameters for a given component.
 
     Args:
         simulator (Module): The main simulator model.
-        task_parameters_dict (Dict[int, Dict[str, Module]]): Dictionary containing task-specific parameters.
-        component (str): The component to update ('encoder', 'processor', or 'decoder').
+        task_parameters_dict (Dict[int, Dict[str, Module or Dict]]): Dictionary containing task-specific parameters.
+        component (str): The component to update ('encoder', 'processor', 'decoder', or 'layerN').
         cfg (Module): Configuration object containing hyperparameters.
 
     Returns:
-        Tuple[Module, Dict[int, Dict[str, Module]]]:
+        Tuple[Module, Dict[int, Dict[str, Module or Dict]]]:
             Updated simulator and task parameters dictionary.
     """
-    # Find the average of the task-specific simulator parameters
+
     task_parameters_list = [task_parameters_dict[task][component] for task in range(cfg.reptile.n_task)]
 
-    # Initialize accumulated parameters for each component
-    accumulated_params = {
-        name: torch.zeros_like(param)
-        for name, param in task_parameters_list[0].named_parameters()
-    }
+    # Handle layerN-style parameters (which are dictionaries of tensors)
+    if component.startswith("layer"):
+        # Initialize accumulation dict
+        accumulated_params = {
+            name: torch.zeros_like(param) for name, param in task_parameters_list[0].items()
+        }
 
-    # Accumulate parameters across tasks for each component
-    for each_task_parameter in task_parameters_list:
-        for name, param in each_task_parameter.named_parameters():
-            accumulated_params[name] += param
+        # Accumulate
+        for each_task_param in task_parameters_list:
+            for name, param in each_task_param.items():
+                accumulated_params[name] += param
 
-    # Compute averaged parameters
-    averaged_params = {name: param / cfg.reptile.n_task for name, param in accumulated_params.items()}
+        # Average
+        averaged_params = {name: param / cfg.reptile.n_task for name, param in accumulated_params.items()}
 
-    # Save references to the original components (encoder, processor, etc.)
-    original_parameters = extract_specific_parameters(simulator, [component])
+        # Extract current parameters
+        original_parameters = extract_specific_parameters(simulator, [component])[component]
 
-    # Compute the difference and update the original simulator components
-    for name, param in original_parameters[component].named_parameters():
-        difference = param - averaged_params[name]
-        param.data.copy_(param - cfg.reptile.outer_loop.step_size * difference)
+        # Gradient-style update
+        for name in original_parameters:
+            diff = original_parameters[name] - averaged_params[name]
+            original_parameters[name] -= cfg.reptile.outer_loop.step_size * diff
 
-    # Restore the updated simulator components
-    simulator = replace_with_parameters(simulator, original_parameters, [component])
+        # Replace updated parameters in the simulator
+        simulator = replace_with_parameters(simulator, {component: original_parameters}, [component])
 
-    # Restore the original task parameters after training
-    for task in range(cfg.reptile.n_task):
-        task_parameters_dict[task][component] = extract_specific_parameters(simulator, [component])[component]
+        # Update each task's parameter dictionary
+        for task in range(cfg.reptile.n_task):
+            task_parameters_dict[task][component] = extract_specific_parameters(simulator, [component])[component]
+
+    else:
+        # Component is a full module like 'encoder', 'processor', or 'decoder'
+        accumulated_params = {
+            name: torch.zeros_like(param)
+            for name, param in task_parameters_list[0].named_parameters()
+        }
+
+        for each_task_parameter in task_parameters_list:
+            for name, param in each_task_parameter.named_parameters():
+                accumulated_params[name] += param
+
+        averaged_params = {name: param / cfg.reptile.n_task for name, param in accumulated_params.items()}
+
+        original_parameters = extract_specific_parameters(simulator, [component])
+
+        for name, param in original_parameters[component].named_parameters():
+            diff = param - averaged_params[name]
+            param.data.copy_(param - cfg.reptile.outer_loop.step_size * diff)
+
+        simulator = replace_with_parameters(simulator, original_parameters, [component])
+
+        for task in range(cfg.reptile.n_task):
+            task_parameters_dict[task][component] = extract_specific_parameters(simulator, [component])[component]
 
     return simulator, task_parameters_dict
 
@@ -1031,8 +1115,16 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
             optimizer.load_state_dict(train_state["optimizer_state"])
             optimizer_to(optimizer, device_id)
 
-            # set global train state
-            step = train_state["global_train_state"]["step"]
+            if "global_train_state" in train_state:
+                step = train_state["global_train_state"]["step"]
+                if "epoch" in train_state["global_train_state"]:
+                    completed_meta_iters = train_state["global_train_state"]["epoch"]
+
+            if "loss_history" in train_state:
+                if "train" in train_state["loss_history"]:
+                    train_loss_hist = train_state["loss_history"]["train"]
+                if "valid" in train_state["loss_history"]:
+                    valid_loss_hist = train_state["loss_history"]["valid"]
 
         else:
             msg = f"Specified model_file {cfg.model.path + cfg.model.file} and train_state_file {cfg.model.path + cfg.model.train_state_file} not found."
@@ -1065,20 +1157,22 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
         n_features -= 1
 
     train_data_iters = {task_no: iter(dl) for task_no, dl in enumerate(train_dl)}
-    valid_data_iters = {task_no: iter(dl) for task_no, dl in enumerate(valid_dl)}
+    
+    if cfg.training.validation_interval is not None:
+        valid_data_iters = {task_no: iter(dl) for task_no, dl in enumerate(valid_dl)}
 
     print(f"rank = {rank}, cuda = {torch.cuda.is_available()}")
 
     writer = setup_tensorboard(cfg, metadata) if verbose else None
 
-    meta_iters = cfg.reptile.outer_loop.iterations
+    total_meta_iters = cfg.reptile.outer_loop.iterations
     if verbose:
-        print(f"Total meta iterations = {meta_iters}")
+        print(f"Total meta iterations = {total_meta_iters}")
 
 
     try:
         for meta_iteration in tqdm(
-            range(meta_iters), desc="Meta-Training", unit="meta_iters", disable=not verbose
+            range(completed_meta_iters, total_meta_iters), desc="Meta-Training", unit="meta_iters", disable=not verbose
         ):
             if use_dist:
                 torch.distributed.barrier()
@@ -1158,7 +1252,6 @@ def train_reptile(rank, cfg, world_size, device, verbose, use_dist):
                             if n_features == 3
                             else None
                             ),
-                            gravity=cfg.training.gravity
                         )
 
                         loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
@@ -1409,7 +1502,6 @@ def validation(simulator, example, n_features, cfg, rank, device_id, use_dist):
             material_property=(
                 material_property.to(device_or_rank) if n_features == 3 else None
             ),
-            gravity=cfg.training.gravity
         )
 
     # Compute loss
