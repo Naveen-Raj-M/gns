@@ -40,10 +40,9 @@ class TrainingConfig:
     validation_interval: Optional[int] = None
     save_steps: int = 500
     resume: Optional[bool] = False
-    gravity: Optional[List[float]] = None
     parameters: Optional[List[str]] = field(default_factory=lambda: ["encoder", "processor", "decoder"])
     learning_rate: LearningRateConfig = field(default_factory=LearningRateConfig)
-    nmessage_passing_steps: int = 10
+    nmessage_passing_steps: Optional[int] = 10
     
 
 @dataclass
@@ -86,7 +85,7 @@ class OuterLoopConfig:
 @dataclass
 class ReptileConfig:
     n_task: int = 3
-    parameters: List[str] = field(default_factory=lambda: ["encoder", "processor", "decoder"])
+    parameters: Optional[List[str]] = field(default_factory=lambda: ["encoder", "processor", "decoder"])
     inner_loop: InnerLoopConfig = field(default_factory=InnerLoopConfig)
     outer_loop: OuterLoopConfig = field(default_factory=OuterLoopConfig)
 
