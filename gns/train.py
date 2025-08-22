@@ -202,7 +202,7 @@ def predict(device: str, cfg: DictConfig):
                 example_rollout["loss"] = loss.mean()
                 filename = f"{cfg.output.filename}_ex{example_i}.pkl"
                 filename_render = f"{cfg.output.filename}_ex{example_i}"
-                filename = os.path.join(cfg.output.path, filename_render)
+                filename = os.path.join(cfg.output.path, filename)
                 with open(filename, "wb") as f:
                     pickle.dump(example_rollout, f)
             if cfg.rendering.mode:
@@ -505,18 +505,19 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
             # reset names to point to the latest.
             cfg.model.file = f"model-{max_model_number}.pt"
             cfg.model.train_state_file = f"train_state-{max_model_number}.pt"
+        
+        model_file_path = os.path.join(cfg.model.path, cfg.model.file)
+        train_state_path = os.path.join(cfg.model.path, cfg.model.train_state_file)
 
-        if os.path.exists(cfg.model.path + cfg.model.file) and os.path.exists(
-            cfg.model.path + cfg.model.train_state_file
-        ):
+        if os.path.exists(model_file_path) and os.path.exists(train_state_path):
             # load model
             if use_dist:
-                simulator.module.load(cfg.model.path + cfg.model.file)
+                simulator.module.load(model_file_path)
             else:
-                simulator.load(cfg.model.path + cfg.model.file)
+                simulator.load(model_file_path)
 
             # load train state
-            train_state = torch.load(cfg.model.path + cfg.model.train_state_file)
+            train_state = torch.load(train_state_path)
 
             # set optimizer state
             optimizer = torch.optim.Adam(
@@ -525,14 +526,21 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
             optimizer.load_state_dict(train_state["optimizer_state"])
             optimizer_to(optimizer, device_id)
 
-            # set global train state
-            step = train_state["global_train_state"]["step"]
-            epoch = train_state["global_train_state"]["epoch"]
-            train_loss_hist = train_state["loss_history"]["train"]
-            valid_loss_hist = train_state["loss_history"]["valid"]
+            step = (train_state.get("global_train_state", {}).get("step") 
+                    or print("Warning: 'step' missing, defaulting to 0") or 0)
+
+            epoch = (train_state.get("global_train_state", {}).get("epoch") 
+                    or print("Warning: 'epoch' missing, defaulting to 0") or 0)
+
+            train_loss_hist = (train_state.get("loss_history", {}).get("train") 
+                            or print("Warning: 'train' loss history missing, initializing empty list") or [])
+
+            valid_loss_hist = (train_state.get("loss_history", {}).get("valid") 
+                            or print("Warning: 'valid' loss history missing, initializing empty list") or [])
 
         else:
-            msg = f"Specified model_file {cfg.model.path + cfg.model.file} and train_state_file {cfg.model.path + cfg.model.train_state_file} not found."
+            
+            msg = f"Specified model_file {model_file_path} and train_state_file {train_state_path} not found."
             raise FileNotFoundError(msg)
 
     simulator.train()
@@ -628,6 +636,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                                 cfg,
                                 rank,
                                 device_id,
+                                use_dist,
                             )
                             writer.add_scalar("Loss/valid", valid_loss.item(), step)
 
@@ -698,9 +707,9 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
             if cfg.training.validation_interval is not None:
                 sampled_valid_example = next(iter(valid_dl))
                 epoch_valid_loss = validation(
-                    simulator, sampled_valid_example, n_features, cfg, rank, device_id
+                    simulator, sampled_valid_example, n_features, cfg, rank, device_id, use_dist,
                 )
-                if device == torch.device("cuda"):
+                if use_dist:
                     torch.distributed.reduce(
                         epoch_valid_loss, dst=0, op=torch.distributed.ReduceOp.SUM
                     )
@@ -807,7 +816,7 @@ def _get_simulator(
     return simulator
 
 
-def validation(simulator, example, n_features, cfg, rank, device_id):
+def validation(simulator, example, n_features, cfg, rank, device_id, use_dist):
     (
         position,
         particle_type,
@@ -830,7 +839,7 @@ def validation(simulator, example, n_features, cfg, rank, device_id):
     # Select the appropriate prediction function
     predict_accelerations = (
         simulator.module.predict_accelerations
-        if isinstance(device_id, int)
+        if use_dist
         else simulator.predict_accelerations
     )
     # Get the predictions and target accelerations
@@ -868,7 +877,7 @@ def main(cfg: Config):
 
         # Create TensorBoard log directory
         if not os.path.exists(cfg.logging.tensorboard_dir):
-            os.makedirs(cfg.logging.tensorboard_dir)
+            os.makedirs(cfg.logging.tensorboard_dir, exist_ok=True)
 
         # Train on gpu
         if device == torch.device("cuda"):
