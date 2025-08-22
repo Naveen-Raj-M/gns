@@ -18,6 +18,8 @@ class LearnedSimulator(nn.Module):
         nmessage_passing_steps: int,
         nmlp_layers: int,
         mlp_hidden_dim: int,
+        use_film: bool,
+        film_mp_blocks: list[int],
         connectivity_radius: float,
         boundaries: np.ndarray,
         normalization_stats: dict,
@@ -70,6 +72,8 @@ class LearnedSimulator(nn.Module):
             nmessage_passing_steps=nmessage_passing_steps,
             nmlp_layers=nmlp_layers,
             mlp_hidden_dim=mlp_hidden_dim,
+            use_film=use_film,
+            film_mp_blocks=film_mp_blocks
         )
 
         self._device = device
@@ -259,6 +263,7 @@ class LearnedSimulator(nn.Module):
         nparticles_per_example: torch.tensor,
         particle_types: torch.tensor,
         material_property: torch.tensor = None,
+        cond: torch.Tensor = None,
     ) -> torch.tensor:
         """Predict position based on acceleration.
 
@@ -268,6 +273,7 @@ class LearnedSimulator(nn.Module):
             examples per batch.
           particle_types: Particle types with shape (nparticles).
           material_property: Friction angle normalized by tan() with shape (nparticles)
+          cond: FiLM conditioning input (B, 1)
 
         Returns:
           next_positions (torch.tensor): Next position of particles.
@@ -284,7 +290,7 @@ class LearnedSimulator(nn.Module):
                 current_positions, nparticles_per_example, particle_types
             )
         predicted_normalized_acceleration = self._encode_process_decode(
-            node_features, edge_index, edge_features
+            node_features, edge_index, edge_features, cond
         )
         next_positions = self._decoder_postprocessor(
             predicted_normalized_acceleration, current_positions
@@ -299,6 +305,7 @@ class LearnedSimulator(nn.Module):
         nparticles_per_example: torch.tensor,
         particle_types: torch.tensor,
         material_property: torch.tensor = None,
+        cond: torch.Tensor = None,
     ):
         """Produces normalized and predicted acceleration targets.
 
@@ -313,6 +320,7 @@ class LearnedSimulator(nn.Module):
             examples per batch.
           particle_types: Particle types with shape (nparticles).
           material_property: Friction angle normalized by tan() with shape (nparticles).
+          cond: FiLM conditioning input (B, 1)
 
         Returns:
           Tensors of shape (nparticles_in_batch, dim) with the predicted and target
@@ -336,7 +344,7 @@ class LearnedSimulator(nn.Module):
                 noisy_position_sequence, nparticles_per_example, particle_types
             )
         predicted_normalized_acceleration = self._encode_process_decode(
-            node_features, edge_index, edge_features
+            node_features, edge_index, edge_features, cond
         )
 
         # Calculate the target acceleration, using an `adjusted_next_position `that

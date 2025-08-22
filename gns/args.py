@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 from omegaconf import MISSING
 from hydra.core.config_store import ConfigStore
 
@@ -40,6 +40,9 @@ class TrainingConfig:
     validation_interval: Optional[int] = None
     save_steps: int = 500
     resume: Optional[bool] = False
+    reset_steps: Optional [bool] = False
+    use_film: bool = True
+    film_mp_blocks: List[int] = field(default_factory=lambda: [0])
     learning_rate: LearningRateConfig = field(default_factory=LearningRateConfig)
 
 

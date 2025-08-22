@@ -10,10 +10,13 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn import Module
+import torch.optim as optim
 from tqdm import tqdm
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from typing import Dict, List
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from gns import learned_simulator
@@ -312,10 +315,14 @@ def save_model_and_train_state(
       valid_loss_hist: validation loss history at each epoch
     """
     if verbose:
+        # Ensure directory exists
+        os.makedirs(cfg.model.path, exist_ok=True)
+        model_file = os.path.join(cfg.model.path, f"model-{step}.pt")
+        train_state_file = os.path.join(cfg.model.path, f"train_state-{step}.pt")
         if not use_dist:
-            simulator.save(cfg.model.path + "model-" + str(step) + ".pt")
+            simulator.save(model_file)
         else:
-            simulator.module.save(cfg.model.path + "model-" + str(step) + ".pt")
+            simulator.module.save(model_file)
 
         train_state = dict(
             optimizer_state=optimizer.state_dict(),
@@ -327,7 +334,7 @@ def save_model_and_train_state(
             },
             loss_history={"train": train_loss_hist, "valid": valid_loss_hist},
         )
-        torch.save(train_state, f"{cfg.model.path}train_state-{step}.pt")
+        torch.save(train_state, train_state_file)
 
 
 def setup_simulator_and_optimizer(cfg, metadata, rank, world_size, device, use_dist):
@@ -467,7 +474,7 @@ def prepare_data(example, device_id):
     return position, particle_type, material_property, n_particles_per_example, labels
 
 
-def get_film_parameters(model_dict: Dict[str, Module]) -> List[torch.Tensor]:
+def get_film_parameters(simulator: Module) -> List[torch.Tensor]:
     """
     Collects all parameters of the FiLM generator from the model dictionary.
 
@@ -477,12 +484,16 @@ def get_film_parameters(model_dict: Dict[str, Module]) -> List[torch.Tensor]:
     Returns:
         List[torch.Tensor]: List of FiLM generator parameters.
     """
-    parameters_list = []
-
-    if "film" in model_dict:
-        parameters_list += list(model_dict["film"].parameters())
+    # Extract FiLM parameters (shared across blocks)
+    if hasattr(simulator._encode_process_decode._processor, "film_module") and simulator._encode_process_decode._processor.film_module is not None:
+        film_state = simulator._encode_process_decode._processor.film_module
     else:
-        print("Warning: 'film' module not found in model_dict")
+        film_state = None
+
+    if film_state is not None:
+        parameters_list = list(film_state.parameters())
+    else:
+        print("Warning: 'film' module not found in Simulator")
 
     return parameters_list
 
@@ -557,8 +568,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
             # set optimizer
             if cfg.training.resume and cfg.training.use_film is not None:
                     # Extract specific parameters for the training
-                    film_parameters = get_film_parameters(simulator.module if use_dist else simulator, 
-                                                                    cfg.training.parameters)
+                    film_parameters = get_film_parameters(simulator.module if use_dist else simulator)
                     
                     # Set optimizer from the saved optimizer state properly
                     optimizer = optim.Adam(
@@ -586,17 +596,18 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                 # Just continue training with new optimizer
                 optimizer_to(optimizer, device_id)
 
-            step = (train_state.get("global_train_state", {}).get("step") 
-                    or print("Warning: 'step' missing, defaulting to 0") or 0)
+            if not cfg.training.reset_steps:
+                step = (train_state.get("global_train_state", {}).get("step") 
+                        or print("Warning: 'step' missing, defaulting to 0") or 0)
 
-            epoch = (train_state.get("global_train_state", {}).get("epoch") 
-                    or print("Warning: 'epoch' missing, defaulting to 0") or 0)
+                epoch = (train_state.get("global_train_state", {}).get("epoch") 
+                        or print("Warning: 'epoch' missing, defaulting to 0") or 0)
 
-            train_loss_hist = (train_state.get("loss_history", {}).get("train") 
-                            or print("Warning: 'train' loss history missing, initializing empty list") or [])
+                train_loss_hist = (train_state.get("loss_history", {}).get("train") 
+                                or print("Warning: 'train' loss history missing, initializing empty list") or [])
 
-            valid_loss_hist = (train_state.get("loss_history", {}).get("valid") 
-                            or print("Warning: 'valid' loss history missing, initializing empty list") or [])
+                valid_loss_hist = (train_state.get("loss_history", {}).get("valid") 
+                                or print("Warning: 'valid' loss history missing, initializing empty list") or [])
 
         else:
             
@@ -682,7 +693,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                         pred_acc, target_acc = predict_fn(
                             next_positions=labels.to(device_or_rank),
                             position_sequence_noise=sampled_noise.to(device_or_rank),
-                            position_sequence=position_input,
+                            position_sequence=position.to(device_or_rank),
                             nparticles_per_example=n_particles_per_example.to(device_or_rank),
                             particle_types=particle_type.to(device_or_rank),
                             material_property=None,  # <- don't send material_property inside predict
@@ -692,7 +703,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                         pred_acc, target_acc = predict_fn(
                             next_positions=labels.to(device_or_rank),
                             position_sequence_noise=sampled_noise.to(device_or_rank),
-                            position_sequence=position_input,
+                            position_sequence=position.to(device_or_rank),
                             nparticles_per_example=n_particles_per_example.to(device_or_rank),
                             particle_types=particle_type.to(device_or_rank),
                             material_property=material_property.to(device_or_rank) if n_features == 3 else None,

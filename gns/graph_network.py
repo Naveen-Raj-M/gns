@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Tuple
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
@@ -43,6 +43,81 @@ def build_mlp(
         mlp.add_module("Act-" + str(i), act[i]())
 
     return mlp
+
+def initialize_film(film_layer, hidden_dim):
+  last_linear = film_layer.film_generator[-2]  # Last Linear layer (before output)
+  nn.init.zeros_(last_linear.weight)  # Zero weight
+  nn.init.zeros_(last_linear.bias)    # Zero bias
+  last_linear.bias.data[:hidden_dim] = 1.0  # Gamma starts at 1, beta starts at 0
+
+
+class FiLM(nn.Module):
+  def __init__(self, hidden_dim: int, mlp_hidden_dim: int, nmlp_layers: int):
+      """
+      FiLM module (Feature-wise Linear Modulation).
+
+      This version applies FiLM modulation using:
+        - h concatenated with upsampled conditioning input (cond MLP)
+        - LayerNorm on MLP outputs
+
+      Args:
+          hidden_dim (int): Dimension of hidden features h.
+          mlp_hidden_dim (int): Hidden layer size in FiLM generator and cond MLPs.
+          nmlp_layers (int): Number of layers in the FiLM generator MLP.
+      """
+      super(FiLM, self).__init__()
+      self.hidden_dim = hidden_dim
+
+      # Conditioning MLP
+      self.cond_mlp = build_mlp(
+          input_size=1,  # scalar cond input
+          hidden_layer_sizes=[mlp_hidden_dim],
+          output_size=hidden_dim,
+          activation=nn.ReLU,
+      )
+      self.use_cond_mlp = True
+
+      # FiLM generator
+      film_input_dim = hidden_dim 
+      self.film_generator = build_mlp(
+          input_size=film_input_dim,
+          hidden_layer_sizes=[mlp_hidden_dim for _ in range(nmlp_layers)],
+          output_size=hidden_dim * 2,
+      )
+
+      # LayerNorm
+      self.norm_cond = nn.LayerNorm(hidden_dim)
+      self.norm_film = nn.LayerNorm(hidden_dim * 2)
+
+      # Initialize FiLM parameters
+      initialize_film(self, hidden_dim)
+
+  def forward(self, h: torch.Tensor, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Forward pass for FiLM.
+
+    Args:
+        h (torch.Tensor): Hidden state of shape [B, hidden_dim].
+        cond (torch.Tensor): Conditioning input of shape [B, 1].
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - gamma: Scaling tensor of shape [B, hidden_dim].
+            - beta: Shifting tensor of shape [B, hidden_dim].
+    """
+    # Upsample cond through cond MLP
+    cond_up = self.cond_mlp(cond)
+    cond_up = self.norm_cond(cond_up)  # LayerNorm for stability
+
+    # Element-wise modulation
+    film_input = h * cond_up
+
+    # Generate gamma and beta
+    gamma_beta = self.film_generator(film_input)
+    gamma_beta = self.norm_film(gamma_beta)  # LayerNorm for stability
+
+    gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+    return gamma, beta
 
 
 class Encoder(nn.Module):
@@ -128,6 +203,7 @@ class InteractionNetwork(MessagePassing):
         nedge_out: int,
         nmlp_layers: int,
         mlp_hidden_dim: int,
+        film_module: nn.Module = None,
     ):
         """InteractionNetwork derived from torch_geometric MessagePassing class
 
@@ -165,8 +241,12 @@ class InteractionNetwork(MessagePassing):
             ]
         )
 
+        # Store the passed FiLM module
+        self.film = film_module
+        self.use_film = self.film is not None
+
     def forward(
-        self, x: torch.tensor, edge_index: torch.tensor, edge_features: torch.tensor
+        self, x: torch.tensor, edge_index: torch.tensor, edge_features: torch.tensor, cond: torch.Tensor = None
     ):
         """The forward hook runs when the InteractionNetwork class is instantiated
 
@@ -177,6 +257,7 @@ class InteractionNetwork(MessagePassing):
             (2, nedges)
           edge_features: Edge features as a torch tensor with shape
             (nedges, nedge_in=latent_dim of 128)
+          cond (torch.Tensor): Conditioning input of shape [B, 1] for FiLM.
 
         Returns:
           tuple: Updated node and edge features
@@ -195,13 +276,13 @@ class InteractionNetwork(MessagePassing):
         # propagate() to update the node embeddings. This is why we need to store
         # the updated edge features to return them from the update() method.
         x, edge_features = self.propagate(
-            edge_index=edge_index, x=x, edge_features=edge_features
+            edge_index=edge_index, x=x, edge_features=edge_features, cond=cond
         )
 
         return x + x_residual, edge_features + edge_features_residual
 
     def message(
-        self, x_i: torch.tensor, x_j: torch.tensor, edge_features: torch.tensor
+        self, x_i: torch.tensor, x_j: torch.tensor, edge_features: torch.tensor, cond: torch.Tensor = None
     ) -> torch.tensor:
         """Constructs message from j to i of edge :math:`e_{i, j}`. Tensors :obj:`x`
         passed to :meth:`propagate` can be mapped to the respective nodes :math:`i`
@@ -215,15 +296,28 @@ class InteractionNetwork(MessagePassing):
             (nparticles, nnode_in=latent_dim of 128) at node j
           edge_features: Edge features as a torch tensor with shape
             (nedges, nedge_in=latent_dim of 128)
+          cond (torch.Tensor): Conditioning input of shape [B, 1] for FiLM.
 
         """
-        # Concat edge features with a final shape of [nedges, latent_dim*3]
-        edge_features = torch.cat([x_i, x_j, edge_features], dim=-1)
-        self._edge_features = self.edge_fn(edge_features)  # Create and store
-        return self._edge_features  # This gets passed to aggregate()
+        h = torch.cat([x_i, x_j, edge_features], dim=-1)
+
+        mlp, norm = self.edge_fn[0], self.edge_fn[1]
+
+        for idx, (name, layer) in enumerate(mlp.named_children()):
+            prev_h = h.clone()  # Save input to this layer
+            h = layer(h)
+
+            # Apply FiLM to all layers except the first
+            if self.use_film and self.film is not None and idx > 0:
+                gamma, beta = self.film(prev_h, cond)
+                h = gamma * h + beta
+
+        h = norm(h)
+        self._edge_features = h
+        return self._edge_features
 
     def update(
-        self, x_updated: torch.tensor, x: torch.tensor, edge_features: torch.tensor
+        self, x_updated: torch.tensor, x: torch.tensor, edge_features: torch.tensor, cond: torch.Tensor = None
     ):
         """Update the particle state representation
 
@@ -234,6 +328,7 @@ class InteractionNetwork(MessagePassing):
             shape (nparticles, nnode_in=latent_dim of 128)
           edge_features: Edge features as a torch tensor with shape
             (nedges, nedge_out=latent_dim of 128)
+          cond (torch.Tensor): Conditioning input of shape [B, 1] for FiLM.
 
         Returns:
           tuple: Updated node and edge features
@@ -245,7 +340,19 @@ class InteractionNetwork(MessagePassing):
         # as first argument and any argument which was initially passed to
         # propagate hence we need to return the stored value of edge_features
         x_updated = torch.cat([x_updated, x], dim=-1)
-        x_updated = self.node_fn(x_updated)
+
+        mlp, norm = self.node_fn[0], self.node_fn[1]
+
+        for idx, (name, layer) in enumerate(mlp.named_children()):
+            prev_x = x_updated.clone()  # Save input to this layer
+            x_updated = layer(x_updated)
+
+            # Apply FiLM to all layers except the first
+            if self.use_film and self.film is not None and idx > 0:
+                gamma, beta = self.film(prev_x, cond)
+                x_updated = gamma * x_updated + beta
+
+        x_updated = norm(x_updated)
         return x_updated, self._edge_features
 
 
@@ -269,6 +376,8 @@ class Processor(MessagePassing):
         nmessage_passing_steps: int,
         nmlp_layers: int,
         mlp_hidden_dim: int,
+        use_film: bool,
+        film_mp_blocks: list[int],
     ):
         """Processor derived from torch_geometric MessagePassing class. The
         processor uses a stack of :math: `M GNs` (where :math: `M` is a
@@ -286,12 +395,31 @@ class Processor(MessagePassing):
           nmessage_passing_steps: Number of message passing steps.
           nmlp_layer: Number of hidden layers in the MLP (typically of size 2).
           mlp_hidden_dim: Size of the hidden layer (latent dimension of size 128).
+          use_film: Whether to use FiLM conditioning.
+          film_mp_blocks: A list of message passing layer indices to apply FiLM to.
 
         """
         super(Processor, self).__init__(aggr="max")
+
+        if use_film:
+            self.film_module = FiLM(
+                hidden_dim=mlp_hidden_dim,
+                mlp_hidden_dim=mlp_hidden_dim,
+                nmlp_layers=nmlp_layers,
+            )
+        else:
+            self.film_module = None
+
+        self.film_mp_blocks = film_mp_blocks
+
         # Create a stack of M Graph Networks GNs.
-        self.gnn_stacks = nn.ModuleList(
-            [
+        self.gnn_stacks = nn.ModuleList()
+        for idx in range(nmessage_passing_steps):
+            # If use_film is true and the current layer index is in film_layers,
+            # pass the central FiLM module. Otherwise, pass None.
+            current_film_module = self.film_module if use_film and idx in self.film_mp_blocks else None
+            
+            self.gnn_stacks.append(
                 InteractionNetwork(
                     nnode_in=nnode_in,
                     nnode_out=nnode_out,
@@ -299,13 +427,12 @@ class Processor(MessagePassing):
                     nedge_out=nedge_out,
                     nmlp_layers=nmlp_layers,
                     mlp_hidden_dim=mlp_hidden_dim,
+                    film_module=current_film_module,  # Pass the module instance
                 )
-                for _ in range(nmessage_passing_steps)
-            ]
-        )
+            )
 
     def forward(
-        self, x: torch.tensor, edge_index: torch.tensor, edge_features: torch.tensor
+        self, x: torch.tensor, edge_index: torch.tensor, edge_features: torch.tensor,  cond: torch.tensor = None
     ):
         """The forward hook runs through GNN stacks when class is instantiated.
 
@@ -316,10 +443,14 @@ class Processor(MessagePassing):
             (2, nedges)
           edge_features: Edge features as a torch tensor with shape
             (nparticles, latent_dim)
+          cond (torch.Tensor): Conditioning input of shape [B, 1] for FiLM.
 
         """
-        for gnn in self.gnn_stacks:
-            x, edge_features = gnn(x, edge_index, edge_features)
+        for idx, gnn in enumerate(self.gnn_stacks):
+            if idx in self.film_mp_blocks:
+                x, edge_features = gnn(x, edge_index, edge_features, cond=cond)
+            else:
+                x, edge_features = gnn(x, edge_index, edge_features)
         return x, edge_features
 
 
@@ -370,6 +501,8 @@ class EncodeProcessDecode(nn.Module):
         nmessage_passing_steps: int,
         nmlp_layers: int,
         mlp_hidden_dim: int,
+        use_film: bool,
+        film_mp_blocks: list[int],
     ):
         """Encode-Process-Decode function approximator for learnable simulator.
 
@@ -385,6 +518,8 @@ class EncodeProcessDecode(nn.Module):
           latent_dim: Size of latent dimension (128)
           nmlp_layer: Number of hidden layers in the MLP (typically of size 2).
           mlp_hidden_dim: Size of the hidden layer (latent dimension of size 128).
+          use_film: Whether to use FiLM conditioning.
+          film_mp_blocks: A list of message passing layer indices to apply FiLM to.
 
         """
         super(EncodeProcessDecode, self).__init__()
@@ -404,6 +539,8 @@ class EncodeProcessDecode(nn.Module):
             nmessage_passing_steps=nmessage_passing_steps,
             nmlp_layers=nmlp_layers,
             mlp_hidden_dim=mlp_hidden_dim,
+            use_film=use_film,
+            film_mp_blocks=film_mp_blocks
         )
         self._decoder = Decoder(
             nnode_in=latent_dim,
@@ -413,7 +550,7 @@ class EncodeProcessDecode(nn.Module):
         )
 
     def forward(
-        self, x: torch.tensor, edge_index: torch.tensor, edge_features: torch.tensor
+        self, x: torch.tensor, edge_index: torch.tensor, edge_features: torch.tensor,  cond: torch.tensor = None
     ):
         """The forward hook runs at instatiation of EncodeProcessorDecode class.
 
@@ -424,12 +561,13 @@ class EncodeProcessDecode(nn.Module):
             (2, nedges)
           edge_features: Edge features as a torch tensor with shape
             (nedges, nedge_in_features)
+          cond (torch.Tensor): Conditioning input of shape [B, 1] for FiLM. 
 
         Returns:
           x: Particle state representation as a torch tensor with shape
             (nparticles, nnode_out_features)
         """
         x, edge_features = self._encoder(x, edge_features)
-        x, edge_features = self._processor(x, edge_index, edge_features)
+        x, edge_features = self._processor(x, edge_index, edge_features, cond=cond)
         x = self._decoder(x)
         return x
