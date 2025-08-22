@@ -121,6 +121,8 @@ def predict(device: str, cfg: DictConfig):
         cfg.data.num_particle_types,
         cfg.data.noise_std,
         cfg.data.noise_std,
+        cfg.training.use_film,
+        cfg.training.film_mp_blocks,
         device,
     )
 
@@ -344,6 +346,8 @@ def setup_simulator_and_optimizer(cfg, metadata, rank, world_size, device, use_d
             cfg.data.num_particle_types,
             cfg.data.noise_std,
             cfg.data.noise_std,
+            cfg.training.use_film,
+            cfg.training.film_mp_blocks,
             rank,
         )
         if use_dist:
@@ -359,6 +363,8 @@ def setup_simulator_and_optimizer(cfg, metadata, rank, world_size, device, use_d
             cfg.data.num_particle_types,
             cfg.data.noise_std,
             cfg.data.noise_std,
+            cfg.training.use_film,
+            cfg.training.film_mp_blocks,
             device,
         )
         optimizer = torch.optim.Adam(
@@ -461,6 +467,26 @@ def prepare_data(example, device_id):
     return position, particle_type, material_property, n_particles_per_example, labels
 
 
+def get_film_parameters(model_dict: Dict[str, Module]) -> List[torch.Tensor]:
+    """
+    Collects all parameters of the FiLM generator from the model dictionary.
+
+    Args:
+        model_dict (Dict[str, Module]): Dictionary containing model components.
+
+    Returns:
+        List[torch.Tensor]: List of FiLM generator parameters.
+    """
+    parameters_list = []
+
+    if "film" in model_dict:
+        parameters_list += list(model_dict["film"].parameters())
+    else:
+        print("Warning: 'film' module not found in model_dict")
+
+    return parameters_list
+
+
 def train(rank, cfg, world_size, device, verbose, use_dist):
     """Train the model.
 
@@ -512,19 +538,53 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
         if os.path.exists(model_file_path) and os.path.exists(train_state_path):
             # load model
             if use_dist:
-                simulator.module.load(model_file_path)
+                missing_keys, unexpected_keys = simulator.module.load_state_dict(
+                    torch.load(model_file_path, map_location=device), strict=False
+                )
             else:
-                simulator.load(model_file_path)
+                missing_keys, unexpected_keys = simulator.load_state_dict(
+                    torch.load(model_file_path, map_location=device), strict=False
+                )
+
+            if verbose:
+                print(f"Loaded model from {model_file_path}")
+                print(f"Missing keys (expected for FiLM): {missing_keys[:3]}...")
+                print(f"Unexpected keys: {unexpected_keys[:3]}...")
 
             # load train state
             train_state = torch.load(train_state_path)
 
-            # set optimizer state
-            optimizer = torch.optim.Adam(
-                simulator.module.parameters() if use_dist else simulator.parameters()
-            )
-            optimizer.load_state_dict(train_state["optimizer_state"])
-            optimizer_to(optimizer, device_id)
+            # set optimizer
+            if cfg.training.resume and cfg.training.use_film is not None:
+                    # Extract specific parameters for the training
+                    film_parameters = get_film_parameters(simulator.module if use_dist else simulator, 
+                                                                    cfg.training.parameters)
+                    
+                    # Set optimizer from the saved optimizer state properly
+                    optimizer = optim.Adam(
+                        film_parameters,
+                        lr=cfg.training.learning_rate.initial
+                    )
+            else:
+
+                optimizer = optim.Adam(
+                    simulator.module.parameters() if use_dist else simulator.parameters(),
+                    lr=cfg.training.learning_rate.initial
+                )
+
+            # Try to load optimizer state carefully
+            try:
+                optimizer.load_state_dict(train_state["optimizer_state"])
+                optimizer_to(optimizer, device_id)
+                if verbose:
+                    print("Loaded optimizer state successfully.")
+            
+            except ValueError as e:
+                if verbose:
+                    print("Warning: Optimizer state not loaded because model parameters changed (e.g., FiLM added).", e)
+                
+                # Just continue training with new optimizer
+                optimizer_to(optimizer, device_id)
 
             step = (train_state.get("global_train_state", {}).get("step") 
                     or print("Warning: 'step' missing, defaulting to 0") or 0)
@@ -587,6 +647,17 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
 
                     n_particles_per_example = n_particles_per_example.to(device_id)
                     labels = labels.to(device_id)
+                    device_or_rank = rank if device == torch.device("cuda") else device
+
+                    # === Set FiLM conditioning input
+                    if cfg.training.use_film:
+                        if n_features == 3:
+                            cond = material_property[0].unsqueeze(0).to(device_or_rank)  
+                        else:
+                            print("Warning: Material property not found for conditioning FiLM")
+                            cond = None
+                    else:
+                        cond = None
 
                     sampled_noise = (
                         noise_utils.get_random_walk_noise_for_position_sequence(
@@ -601,26 +672,31 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                     )
                     sampled_noise *= non_kinematic_mask.view(-1, 1, 1)
 
-                    device_or_rank = rank if device == torch.device("cuda") else device
                     predict_fn = (
                         simulator.module.predict_accelerations
                         if use_dist
                         else simulator.predict_accelerations
                     )
-                    pred_acc, target_acc = predict_fn(
-                        next_positions=labels.to(device_or_rank),
-                        position_sequence_noise=sampled_noise.to(device_or_rank),
-                        position_sequence=position.to(device_or_rank),
-                        nparticles_per_example=n_particles_per_example.to(
-                            device_or_rank
-                        ),
-                        particle_types=particle_type.to(device_or_rank),
-                        material_property=(
-                            material_property.to(device_or_rank)
-                            if n_features == 3
-                            else None
-                        ),
-                    )
+
+                    if cfg.training.use_film:
+                        pred_acc, target_acc = predict_fn(
+                            next_positions=labels.to(device_or_rank),
+                            position_sequence_noise=sampled_noise.to(device_or_rank),
+                            position_sequence=position_input,
+                            nparticles_per_example=n_particles_per_example.to(device_or_rank),
+                            particle_types=particle_type.to(device_or_rank),
+                            material_property=None,  # <- don't send material_property inside predict
+                            cond=cond,  # <- instead pass as input to FiLM network
+                        )
+                    else:
+                        pred_acc, target_acc = predict_fn(
+                            next_positions=labels.to(device_or_rank),
+                            position_sequence_noise=sampled_noise.to(device_or_rank),
+                            position_sequence=position_input,
+                            nparticles_per_example=n_particles_per_example.to(device_or_rank),
+                            particle_types=particle_type.to(device_or_rank),
+                            material_property=material_property.to(device_or_rank) if n_features == 3 else None,
+                        )
 
                     if (
                         cfg.training.validation_interval is not None
@@ -756,6 +832,8 @@ def _get_simulator(
     num_particle_types: int,
     acc_noise_std: float,
     vel_noise_std: float,
+    use_film: bool,
+    film_mp_blocks: list[int],
     device: torch.device,
 ) -> learned_simulator.LearnedSimulator:
     """Instantiates the simulator.
@@ -802,6 +880,8 @@ def _get_simulator(
         nmessage_passing_steps=10,
         nmlp_layers=2,
         mlp_hidden_dim=128,
+        use_film=use_film,
+        film_mp_blocks=film_mp_blocks,
         connectivity_radius=metadata["default_connectivity_radius"],
         boundaries=np.array(metadata["bounds"]),
         normalization_stats=normalization_stats,
