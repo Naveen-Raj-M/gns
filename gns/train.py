@@ -526,14 +526,21 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
             optimizer.load_state_dict(train_state["optimizer_state"])
             optimizer_to(optimizer, device_id)
 
-            # set global train state
-            step = train_state["global_train_state"]["step"]
-            epoch = train_state["global_train_state"]["epoch"]
-            train_loss_hist = train_state["loss_history"]["train"]
-            valid_loss_hist = train_state["loss_history"]["valid"]
+            step = (train_state.get("global_train_state", {}).get("step") 
+                    or print("Warning: 'step' missing, defaulting to 0") or 0)
+
+            epoch = (train_state.get("global_train_state", {}).get("epoch") 
+                    or print("Warning: 'epoch' missing, defaulting to 0") or 0)
+
+            train_loss_hist = (train_state.get("loss_history", {}).get("train") 
+                            or print("Warning: 'train' loss history missing, initializing empty list") or [])
+
+            valid_loss_hist = (train_state.get("loss_history", {}).get("valid") 
+                            or print("Warning: 'valid' loss history missing, initializing empty list") or [])
 
         else:
-            msg = f"Specified model_file {cfg.model.path + cfg.model.file} and train_state_file {cfg.model.path + cfg.model.train_state_file} not found."
+            
+            msg = f"Specified model_file {model_file_path} and train_state_file {train_state_path} not found."
             raise FileNotFoundError(msg)
 
     simulator.train()
