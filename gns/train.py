@@ -869,7 +869,7 @@ def main(cfg: Config):
 
         # Create TensorBoard log directory
         if not os.path.exists(cfg.logging.tensorboard_dir):
-            os.makedirs(cfg.logging.tensorboard_dir)
+            os.makedirs(cfg.logging.tensorboard_dir, exist_ok=True)
 
         # Train on gpu
         if device == torch.device("cuda"):
