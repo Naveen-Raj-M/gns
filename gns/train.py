@@ -505,18 +505,19 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
             # reset names to point to the latest.
             cfg.model.file = f"model-{max_model_number}.pt"
             cfg.model.train_state_file = f"train_state-{max_model_number}.pt"
+        
+        model_file_path = os.path.join(cfg.model.path, cfg.model.file)
+        train_state_path = os.path.join(cfg.model.path, cfg.model.train_state_file)
 
-        if os.path.exists(cfg.model.path + cfg.model.file) and os.path.exists(
-            cfg.model.path + cfg.model.train_state_file
-        ):
+        if os.path.exists(model_file_path) and os.path.exists(train_state_path):
             # load model
             if use_dist:
-                simulator.module.load(cfg.model.path + cfg.model.file)
+                simulator.module.load(model_file_path)
             else:
-                simulator.load(cfg.model.path + cfg.model.file)
+                simulator.load(model_file_path)
 
             # load train state
-            train_state = torch.load(cfg.model.path + cfg.model.train_state_file)
+            train_state = torch.load(train_state_path)
 
             # set optimizer state
             optimizer = torch.optim.Adam(
