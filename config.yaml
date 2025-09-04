@@ -9,11 +9,11 @@ hydra:
     dir: .
 
 # Top-level configuration
-mode: train
+mode: rollout
 
 # Data configuration
 data:
-  path: ../gns-sample/WaterDropSample/dataset/
+  path: data/
   batch_size: 2
   noise_std: 6.7e-4
   input_sequence_length: 6
@@ -22,21 +22,24 @@ data:
 
 # Model configuration
 model:
-  path: ../gns-sample/WaterDropSample/models/
-  file: model-1500.pt
-  train_state_file: train_state-1500.pt
+  path: model/
+  file: model.pt
+  train_state_file: train_statept
 
 # Output configuration
 output:
-  path: ../gns-sample/WaterDropSample/rollouts/
-  filename: rollout
+  path: rollout/
+  filename: test
 
 # Training configuration
 training:
   steps: 100
   validation_interval: null
   save_steps: 500
-  resume: False
+  resume: True
+  use_film: True
+  film_mp_blocks: [0]
+  reset_steps: True
   learning_rate:
     initial: 1e-4
     decay: 0.1
