@@ -73,7 +73,7 @@ class FiLM(nn.Module):
           input_size=1,  # scalar cond input
           hidden_layer_sizes=[mlp_hidden_dim],
           output_size=hidden_dim,
-          activation=nn.ReLU,
+          activation=nn.Tanh,
       )
       self.use_cond_mlp = True
 
@@ -295,16 +295,22 @@ class InteractionNetwork(MessagePassing):
         """
         h = torch.cat([x_i, x_j, edge_features], dim=-1)
 
+        # Define mlp and norm by extracting from self.edge_fn
         mlp, norm = self.edge_fn[0], self.edge_fn[1]
 
-        for idx, (name, layer) in enumerate(mlp.named_children()):
-            prev_h = h.clone()  # Save input to this layer
+        prev_h = None
+        for name, layer in mlp.named_children():
+            # Save the input to the linear layer
+            if name.startswith("NN-"):
+                prev_h = h.clone()
+
             h = layer(h)
 
-            # Apply FiLM to all layers except the first
-            if self.use_film and self.film is not None and idx > 0:
-                gamma, beta = self.film(prev_h, cond)
-                h = gamma * h + beta
+            # Apply FiLM ONLY after a hidden linear layer ('NN-1', 'NN-2', etc.)
+            if name.startswith("NN-") and self.use_film:
+                if name != "NN-0":  # Don't apply to the first layer
+                    gamma, beta = self.film(prev_h, cond)
+                    h = gamma * h + beta
 
         h = norm(h)
         self._edge_features = h
@@ -334,17 +340,22 @@ class InteractionNetwork(MessagePassing):
         # as first argument and any argument which was initially passed to
         # propagate hence we need to return the stored value of edge_features
         x_updated = torch.cat([x_updated, x], dim=-1)
-
         mlp, norm = self.node_fn[0], self.node_fn[1]
 
-        for idx, (name, layer) in enumerate(mlp.named_children()):
-            prev_x = x_updated.clone()  # Save input to this layer
+        prev_x = None
+        for name, layer in mlp.named_children():
+            # Save the input to the linear layer
+            if name.startswith("NN-"):
+                prev_x = x_updated.clone()
+
             x_updated = layer(x_updated)
 
-            # Apply FiLM to all layers except the first
-            if self.use_film and self.film is not None and idx > 0:
-                gamma, beta = self.film(prev_x, cond)
-                x_updated = gamma * x_updated + beta
+            # Apply FiLM ONLY after a linear layer ('NN-')
+            if name.startswith("NN-") and self.use_film:
+                # The original code applies it to hidden layers, so we skip the first one (NN-0)
+                if name not in ["NN-0"]:
+                    gamma, beta = self.film(prev_x, cond)
+                    x_updated = gamma * x_updated + beta
 
         x_updated = norm(x_updated)
         return x_updated, self._edge_features

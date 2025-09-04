@@ -61,12 +61,21 @@ def rollout(
 
     for step in tqdm(range(nsteps), total=nsteps):
         # Get next position with shape (nnodes, dim)
-        next_position = simulator.predict_positions(
-            current_positions,
-            nparticles_per_example=[n_particles_per_example],
-            particle_types=particle_types,
-            material_property=material_property,
-        )
+        if cfg.training.use_film:
+            next_position = simulator.predict_positions(
+                current_positions,
+                nparticles_per_example=[n_particles_per_example],
+                particle_types=particle_types,
+                material_property=None,
+                cond=material_property[0].unsqueeze(0).to(device)
+            )
+        else:
+            next_position = simulator.predict_positions(
+                current_positions,
+                nparticles_per_example=[n_particles_per_example],
+                particle_types=particle_types,
+                material_property=material_property
+            )
 
         # Update kinematic particles from prescribed trajectory.
         kinematic_mask = (
