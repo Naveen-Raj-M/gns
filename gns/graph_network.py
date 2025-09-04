@@ -85,10 +85,6 @@ class FiLM(nn.Module):
           output_size=hidden_dim * 2,
       )
 
-      # LayerNorm
-      self.norm_cond = nn.LayerNorm(hidden_dim)
-      self.norm_film = nn.LayerNorm(hidden_dim * 2)
-
       # Initialize FiLM parameters
       initialize_film(self, hidden_dim)
 
@@ -107,14 +103,12 @@ class FiLM(nn.Module):
     """
     # Upsample cond through cond MLP
     cond_up = self.cond_mlp(cond)
-    cond_up = self.norm_cond(cond_up)  # LayerNorm for stability
 
     # Element-wise modulation
     film_input = h * cond_up
 
     # Generate gamma and beta
     gamma_beta = self.film_generator(film_input)
-    gamma_beta = self.norm_film(gamma_beta)  # LayerNorm for stability
 
     gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
     return gamma, beta
